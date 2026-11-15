@@ -110,3 +110,4 @@ backend/
 
 - **TAP (Table Access Protocol)**: Uses synchronous POST queries against `https://gea.esac.esa.int/tap-server/tap/sync`.
 - **Query Language**: ADQL (Astronomical Data Query Language) selecting `source_id`, `ra`, `dec`, `parallax`, `pmra`, `pmdec`, and photometry from `gaiadr3.gaia_source`.
+

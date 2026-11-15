@@ -9,3 +9,4 @@ This directory contains technical and scientific documentation for AstroChronosc
 - [API Reference](API_REFERENCE.md): REST API contracts, request payloads, response schemas, error handling, and file retrieval endpoints.
 - [Scientific Pipeline](SCIENTIFIC_PIPELINE.md): Methodologies for WCS astrometry, image reprojection, differential subtraction, aperture photometry, light curves, spectral extraction, and Gaia cross-matching.
 - [NASA Benchmark Targets](BENCHMARK_TARGETS.md): Reference parameters, astrometric coordinates, proper motion vectors, and scientific relevance for the five challenge targets.
+

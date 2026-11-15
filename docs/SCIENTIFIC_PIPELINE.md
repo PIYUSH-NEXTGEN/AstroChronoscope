@@ -121,3 +121,4 @@ SPHEREx sources are cross-matched with ESA Gaia DR3 astrometric catalog stars:
 - **Positional Uncertainty Significance**: Matches are evaluated against the combined positional uncertainty:
   `sigma_total = sqrt(sigma_SPHEREx^2 + sigma_Gaia^2)`
   A candidate inside the search radius is assigned a Bayesian match p-value using a Rayleigh distribution tail.
+

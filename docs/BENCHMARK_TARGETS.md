@@ -67,3 +67,4 @@ AstroChronoscope implements linear space-motion coordinate propagation:
 `Dec_propagated = Dec_initial + delta_Dec_deg`
 
 Users can toggle space-motion propagation in the Discovery workspace to immediately switch the search coordinates between catalog epoch (J2000.0) and observation epoch (J2026.5).
+

@@ -147,3 +147,4 @@ The Job Monitor tracks genuine synchronous HTTP requests initiated by the fronte
 - **Observatory Storage Telemetry**:
   - Real-time disk storage breakdown: file counts and byte volumes for FITS cutouts, PNG previews, comparison files, detected sources, light curves, and spectra.
   - Computational stack environment summary: Astropy, Reproject, Photutils, and SciPy.
+

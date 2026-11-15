@@ -253,3 +253,4 @@ Retrieves Gaia DR3 counterparts for a detected SPHEREx source, applying proper m
 
 ### `GET /api/v1/files/{filename}`
 Serves generated FITS files and PNG previews from backend storage. Validates filename formats to prevent path-traversal attacks.
+
