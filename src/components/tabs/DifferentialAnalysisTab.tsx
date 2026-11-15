@@ -277,7 +277,7 @@ export default function DifferentialAnalysisTab({
             <button
               onClick={onRunComparison}
               disabled={!canCompare || isComparing}
-              className="px-4 py-1.5 bg-blue-600 hover:bg-blue-500 disabled:bg-neutral-800 text-white font-bold text-xs uppercase cursor-pointer disabled:cursor-not-allowed flex items-center gap-2"
+              className="px-4 py-1.5 bg-blue-600 hover:bg-blue-500 disabled:bg-neutral-800 text-white font-bold text-xs uppercase cursor-pointer disabled:cursor-not-allowed flex items-center justify-center gap-2.5"
             >
               {isComparing ? (
                 <>
