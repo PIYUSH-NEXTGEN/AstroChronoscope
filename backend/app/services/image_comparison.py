@@ -24,6 +24,7 @@ import os
 import platform
 import re
 import threading
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -41,7 +42,6 @@ from app.core.exceptions import (
     ComparisonNotFoundError,
     ImageProcessingLimitError,
     InvalidCoordinateError,
-    MissingAccessUrlError,
     PlanetXError,
     ProcessingBusyError,
     ReprojectionError,
@@ -66,13 +66,8 @@ from app.schemas.image_processing import (
     QualityAssessment,
     ReprojectionInfo,
 )
-from app.services.cutout_service import CutoutService
-from app.services.fits_service import (
-    ScienceImage,
-    download_fits,
-    extract_science_image,
-    get_fits_product,
-)
+from app.services.artifact_resolver import resolve_observation_artifact
+from app.services.fits_service import ScienceImage, extract_science_image
 from app.services.image_inspection import invalid_flag_mask, inspect_fits, pixel_scale_arcsec
 from app.services.image_reprojection import CommonGrid, measure_residual_shift, reproject
 from app.services.observation_service import ObservationService
@@ -113,7 +108,6 @@ class ImageComparisonService:
         self.observations = observations
         self.settings = observations.settings
         self.cache = observations.cache
-        self.cutouts = CutoutService(self.settings)
         self.settings.ensure_dirs()
 
     # -------------------------------------------------------------- inspection
@@ -958,37 +952,15 @@ class ImageComparisonService:
     def _resolve_artifact(
         self, observation_id: str, ra: float | None, dec: float | None, size: float | None
     ) -> tuple[Any, Path, str]:
-        detail = self.observations.get_observation(observation_id).observation
-        if not detail.fits_access_url:
-            raise MissingAccessUrlError(
-                "This observation has no FITS access_url", details={"observation_id": observation_id}
-            )
-        product = get_fits_product(
-            {
-                "access_url": detail.fits_access_url,
-                "access_format": detail.access_format,
-                "obs_publisher_did": detail.obs_publisher_did,
-                "observation_id": observation_id,
-            },
-            self.settings,
+        resolved = resolve_observation_artifact(
+            self.observations,
+            observation_id,
+            ra,
+            dec,
+            size,
+            default_size=self.settings.comparison_size_deg,
         )
-        if ra is not None and dec is not None:
-            ra, dec = validate_coordinates(ra, dec)
-            size = validate_cutout_size(
-                size if size is not None else self.settings.comparison_size_deg,
-                self.settings.max_cutout_size_deg,
-            )
-            artifact = self.cutouts.fetch(
-                product.access_url, ra, dec, size, session=self.observations.client.session
-            )
-            return detail, artifact.path, "cutout"
-
-        path = self.settings.fits_dir / f"{hashlib.sha256(product.access_url.encode('utf-8')).hexdigest()}.fits"
-        if not path.is_file():
-            download_fits(
-                product.access_url, path, session=self.observations.client.session, settings=self.settings
-            )
-        return detail, path, "product"
+        return resolved.detail, resolved.path, resolved.source
 
     # ----------------------------------------------------------------- storage
     def _store(self, result: ComparisonResponse) -> None:
@@ -1223,12 +1195,15 @@ def _artifact_name(key: str, kind: str, suffix: str) -> str:
 
 def _write_primary(path: Path, data: np.ndarray, header: fits.Header) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_suffix(path.suffix + ".part")
+    temp = path.with_name(f"{path.stem}.{uuid.uuid4().hex}.part")
     try:
         fits.PrimaryHDU(data=data, header=header).writeto(temp, overwrite=True, output_verify="silentfix")
         os.replace(temp, path)
     finally:
-        temp.unlink(missing_ok=True)
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _card(value: str | None) -> str:

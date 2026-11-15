@@ -7,3 +7,17 @@ __pycache__/
 .venv/
 env/
 venv/
+
+# Runtime storage artifacts
+storage/fits/*
+storage/previews/*
+storage/comparisons/*
+storage/sources/*
+storage/lightcurves/*
+storage/spectra/*
+!storage/fits/.gitkeep
+!storage/previews/.gitkeep
+!storage/comparisons/.gitkeep
+!storage/sources/.gitkeep
+!storage/lightcurves/.gitkeep
+!storage/spectra/.gitkeep

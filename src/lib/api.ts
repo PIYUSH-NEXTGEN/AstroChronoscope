@@ -304,6 +304,220 @@ export interface ComparisonResponse {
   };
 }
 
+// ------------------------------------------------------------------
+// Phase 3: Source Detection, Aperture Photometry & Light Curves
+// ------------------------------------------------------------------
+
+export type SourceQuality = 'PASS' | 'WARNING' | 'FAIL' | 'NOT_VERIFIED';
+
+export interface DetectionConfig {
+  threshold_sigma?: number;
+  min_area_px?: number;
+  max_sources?: number;
+  filter_fwhm_px?: number;
+  edge_margin_px?: number;
+  background_mesh?: number;
+  deblend?: boolean;
+}
+
+export interface DetectionRequest {
+  observation_id: string;
+  ra?: number;
+  dec?: number;
+  size?: number;
+  config?: DetectionConfig;
+}
+
+export interface DetectedSource {
+  detection_id: string;
+  source_id?: string | null;
+  x: number;
+  y: number;
+  ra_deg?: number | null;
+  dec_deg?: number | null;
+  peak_value?: number | null;
+  source_area: number;
+  centroid_x: number;
+  centroid_y: number;
+  detection_snr?: number | null;
+  centroid_error_px?: number | null;
+  centroid_error_arcsec?: number | null;
+  fwhm_px?: number | null;
+  fwhm_arcsec?: number | null;
+  ellipticity?: number | null;
+  orientation_deg?: number | null;
+  background_level?: number | null;
+  noise_sigma?: number | null;
+  blended: boolean;
+  flags: string[];
+  quality: SourceQuality;
+}
+
+export interface DetectionResponse {
+  success: boolean;
+  observation_id: string;
+  source: 'cutout' | 'product';
+  source_url?: string | null;
+  target?: TargetCoordinates | null;
+  size_deg?: number | null;
+  detections: DetectedSource[];
+  total_detections: number;
+  truncated: boolean;
+  quality: {
+    overall_status: SourceQuality;
+    warnings: string[];
+  };
+}
+
+export interface PhotometryConfig {
+  aperture_fwhm_factor?: number;
+  annulus_inner_factor?: number;
+  annulus_outer_factor?: number;
+  aperture_oversample?: number;
+  min_valid_fraction?: number;
+}
+
+export interface PhotometryRequest {
+  observation_id: string;
+  ra?: number;
+  dec?: number;
+  size?: number;
+  detection?: DetectionConfig;
+  config?: PhotometryConfig;
+}
+
+export interface FluxMeasurement {
+  detection_id: string;
+  observation_id: string;
+  obs_publisher_did?: string | null;
+  band?: string | null;
+  observation_time?: string | null;
+  time_mjd?: number | null;
+  x: number;
+  y: number;
+  ra_deg?: number | null;
+  dec_deg?: number | null;
+  centroid_error_px?: number | null;
+  centroid_error_arcsec?: number | null;
+  aperture_radius_px: number;
+  aperture_radius_arcsec?: number | null;
+  aperture_valid_fraction: number;
+  psf_fwhm_px: number;
+  flux_mjy?: number | null;
+  flux_jy?: number | null;
+  flux_jy_error?: number | null;
+  snr?: number | null;
+  quality: SourceQuality;
+  flags: string[];
+}
+
+export interface PhotometryResponse {
+  success: boolean;
+  observation_id: string;
+  measurements: FluxMeasurement[];
+  total_measurements: number;
+  quality: {
+    overall_status: SourceQuality;
+    warnings: string[];
+  };
+}
+
+export interface LightCurvePoint {
+  time_utc?: string | null;
+  time_mjd?: number | null;
+  flux_jy: number;
+  flux_jy_error?: number | null;
+  unit: string;
+  band?: string | null;
+  observation_id: string;
+  detection_id: string;
+  snr?: number | null;
+  quality: SourceQuality;
+  flags: string[];
+}
+
+export interface VariabilityMetrics {
+  algorithm_version: string;
+  status: 'computed' | 'insufficient_data' | 'undefined_uncertainties';
+  unit: string;
+  n_points: number;
+  mean_flux_jy?: number | null;
+  median_flux_jy?: number | null;
+  weighted_mean_flux_jy?: number | null;
+  sample_std_jy?: number | null;
+  mad_jy?: number | null;
+  robust_sigma_jy?: number | null;
+  fractional_variability?: number | null;
+  chi2?: number | null;
+  dof?: number | null;
+  reduced_chi2?: number | null;
+  chi2_pvalue?: number | null;
+  peak_to_peak_jy?: number | null;
+  robust_range_jy?: number | null;
+  min_flux_jy?: number | null;
+  max_flux_jy?: number | null;
+  temporal_baseline_days?: number | null;
+  max_gap_days?: number | null;
+  flags: string[];
+}
+
+export interface LightCurveSeries {
+  band?: string | null;
+  points: LightCurvePoint[];
+  expected_epochs: number;
+  non_detections: number;
+  metrics: VariabilityMetrics;
+}
+
+export interface SourceLightCurve {
+  source_id: string;
+  reference_ra_deg: number;
+  reference_dec_deg: number;
+  epoch_count: number;
+  bands: string[];
+  position_scatter_arcsec?: number | null;
+  series: LightCurveSeries[];
+  flags: string[];
+}
+
+export interface TargetLightCurveRequest {
+  ra: number;
+  dec: number;
+  radius_deg?: number;
+  cutout_size_deg?: number;
+  collection?: string;
+  bands?: string[];
+  start_date?: string;
+  end_date?: string;
+  max_observations?: number;
+  detection?: DetectionConfig;
+  photometry?: PhotometryConfig;
+}
+
+export interface TargetLightCurveResponse {
+  success: boolean;
+  target: TargetCoordinates;
+  epochs_considered: number;
+  epochs_processed: number;
+  products_processed: number;
+  sources: SourceLightCurve[];
+  failures: Array<{ epoch_key?: string; observation_id?: string; band?: string; code: string; message: string }>;
+  warnings: string[];
+}
+
+export interface SourceDetailResponse {
+  success: boolean;
+  source: {
+    source_id: string;
+    reference_ra_deg: number;
+    reference_dec_deg: number;
+    detection_count: number;
+    epoch_count: number;
+    bands: string[];
+    flags: string[];
+  };
+}
+
 export interface ApiErrorPayload {
   code: string;
   message: string;
@@ -427,6 +641,504 @@ export async function compareImages(payload: CompareRequest): Promise<Comparison
 /** Retrieve an existing comparison record */
 export async function getComparison(comparisonId: string): Promise<ComparisonResponse> {
   return request<ComparisonResponse>(`/api/v1/images/comparisons/${encodeURIComponent(comparisonId)}`);
+}
+
+/** Detect compact sources in one SPHEREx epoch product */
+export async function detectSources(payload: DetectionRequest): Promise<DetectionResponse> {
+  return request<DetectionResponse>('/api/v1/sources/detect', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+}
+
+/** Measure aperture photometry for detected sources in an epoch */
+export async function measurePhotometry(payload: PhotometryRequest): Promise<PhotometryResponse> {
+  return request<PhotometryResponse>('/api/v1/sources/photometry', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+}
+
+/** Generate cross-epoch light curves with variability metrics */
+export async function getTargetLightCurve(payload: TargetLightCurveRequest): Promise<TargetLightCurveResponse> {
+  return request<TargetLightCurveResponse>('/api/v1/targets/lightcurve', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+}
+
+/** Retrieve a persisted source catalog record */
+export async function getSource(sourceId: string): Promise<SourceDetailResponse> {
+  return request<SourceDetailResponse>(`/api/v1/sources/${encodeURIComponent(sourceId)}`);
+}
+
+export interface StorageDirectoryTelemetry {
+  count: number;
+  size_bytes: number;
+}
+
+export interface StorageTelemetryResponse {
+  success: boolean;
+  status: string;
+  version: string;
+  default_collection: string;
+  sia_endpoint: string;
+  storage: {
+    fits: StorageDirectoryTelemetry;
+    previews: StorageDirectoryTelemetry;
+    comparisons: StorageDirectoryTelemetry;
+    sources: StorageDirectoryTelemetry;
+    lightcurves: StorageDirectoryTelemetry;
+    spectra?: StorageDirectoryTelemetry;
+    total_files: number;
+    total_size_bytes: number;
+  };
+}
+
+// =============================================================================
+// PHASE 4: SPHEREx DR1 Spectral Cube Contracts
+// =============================================================================
+
+export type SpectralQuality = "PASS" | "WARNING" | "FAIL" | "NOT_VERIFIED";
+export type WavelengthUnit = "um";
+export type FluxUnit = "MJy/sr";
+export type FluxKind = "surface_brightness";
+
+export interface SpectralExtractionConfig {
+  spatial_method?: "bilinear" | "nearest";
+}
+
+export interface SpectralExtractionRequest {
+  source_id?: string;
+  ra?: number;
+  dec?: number;
+  collection?: string;
+  config?: SpectralExtractionConfig;
+}
+
+export interface SpectralChannel {
+  index: number;
+  detector?: number | null;
+  subchan?: number | null;
+  wavelength_um?: number | null;
+  wl_min_um?: number | null;
+  wl_max_um?: number | null;
+  bandwidth_um?: number | null;
+  resolving_power?: number | null;
+  flux_mjy_sr?: number | null;
+  uncertainty_mjy_sr?: number | null;
+  nhits?: number | null;
+  flags?: number | null;
+  flags_applied: string[];
+  quality: SpectralQuality;
+}
+
+export interface SpectralQualitySummary {
+  overall_status: SpectralQuality;
+  uncertainty_status: SpectralQuality;
+  warnings: string[];
+}
+
+export interface Spectrum {
+  spectrum_id: string;
+  source_id?: string | null;
+  product_type: "spherex_dr1_all_sky_cube";
+  collection: string;
+  product_id: string;
+  obs_id?: string | null;
+  obs_publisher_did?: string | null;
+  ra_deg: number;
+  dec_deg: number;
+  pixel_x?: number | null;
+  pixel_y?: number | null;
+  wavelength_unit: WavelengthUnit;
+  flux_unit: FluxUnit;
+  flux_kind: FluxKind;
+  extraction_method: "cube_point_extraction";
+  channel_count: number;
+  valid_channel_count: number;
+  blank_channels: number[];
+  wavelength_min_um?: number | null;
+  wavelength_max_um?: number | null;
+  channels: SpectralChannel[];
+  quality: SpectralQualitySummary;
+  limitations: string[];
+}
+
+export interface SpectralProvenance {
+  created_at: string;
+  software: Record<string, string>;
+  algorithm: string;
+  algorithm_version: string;
+  collection: string;
+  access_url: string;
+  fits_sha256: string;
+  npix?: number | null;
+  order?: number | null;
+  config: Record<string, unknown>;
+}
+
+export interface SpectralExtractionResponse {
+  success: true;
+  spectrum: Spectrum;
+  provenance: SpectralProvenance;
+}
+
+export interface SpectralComparisonConfig {
+  min_overlap_channels?: number;
+  wavelength_tolerance_um?: number;
+}
+
+export interface SpectralComparisonRequest {
+  spectrum_id_a: string;
+  spectrum_id_b: string;
+  config?: SpectralComparisonConfig;
+}
+
+export interface SpectralComparisonChannel {
+  index_a: number;
+  index_b: number;
+  wavelength_um?: number | null;
+  flux_a_mjy_sr?: number | null;
+  flux_b_mjy_sr?: number | null;
+  difference_mjy_sr?: number | null;
+  ratio?: number | null;
+  quality: SpectralQuality;
+}
+
+export interface SpectralComparison {
+  spectrum_id_a: string;
+  spectrum_id_b: string;
+  product_id_a?: string | null;
+  product_id_b?: string | null;
+  comparison_basis:
+    | "same_spectrum"
+    | "same_product_static_mosaic"
+    | "different_products_static_mosaic"
+    | "unknown";
+  grid_compatible: boolean;
+  wavelength_unit: WavelengthUnit;
+  flux_unit: FluxUnit;
+  overlap_channel_count: number;
+  channels: SpectralComparisonChannel[];
+  quality: SpectralQualitySummary;
+  warnings: string[];
+  limitations: string[];
+  algorithm_version: string;
+  created_at?: string | null;
+}
+
+export interface SpectralComparisonResponse {
+  success: true;
+  comparison: SpectralComparison;
+}
+
+export interface SpectralSummary {
+  spectrum_id: string;
+  source_id?: string | null;
+  collection: string;
+  product_id: string;
+  ra_deg: number;
+  dec_deg: number;
+  valid_channel_count: number;
+  channel_count: number;
+  wavelength_min_um?: number | null;
+  wavelength_max_um?: number | null;
+  quality: SpectralQuality;
+  created_at: string;
+}
+
+export interface SourceSpectraResponse {
+  success: true;
+  source_id: string;
+  spectra: SpectralSummary[];
+}
+
+/** Extract a calibrated 102-channel 1D spectrum from SPHEREx DR1 all-sky cube at coordinates or source */
+export async function extractSpectrum(payload: SpectralExtractionRequest): Promise<SpectralExtractionResponse> {
+  return request<SpectralExtractionResponse>('/api/v1/spectra/extract', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+}
+
+/** Compare two extracted cube spectra on matched wavelength grid */
+export async function compareSpectra(payload: SpectralComparisonRequest): Promise<SpectralComparisonResponse> {
+  return request<SpectralComparisonResponse>('/api/v1/spectra/compare', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+}
+
+/** Retrieve a persisted spectrum record by ID */
+export async function getSpectrum(spectrumId: string): Promise<SpectralExtractionResponse> {
+  return request<SpectralExtractionResponse>(`/api/v1/spectra/${encodeURIComponent(spectrumId)}`);
+}
+
+/** Retrieve all cube spectra associated with a source */
+export async function getSourceSpectra(sourceId: string): Promise<SourceSpectraResponse> {
+  return request<SourceSpectraResponse>(`/api/v1/sources/${encodeURIComponent(sourceId)}/spectra`);
+}
+
+/** Retrieve observatory storage and cache telemetry */
+export async function getStorageTelemetry(): Promise<StorageTelemetryResponse> {
+  return request<StorageTelemetryResponse>('/api/v1/telemetry');
+}
+
+// ------------------------------------------------------------------
+// Phase 5: Gaia DR3 Integration & Cross-Matching
+// ------------------------------------------------------------------
+
+export type MatchStatus = "MATCHED" | "AMBIGUOUS" | "UNMATCHED";
+
+export interface GaiaProvenance {
+  catalog: string;
+  retrieved_at: string;
+  query_reference?: string | null;
+  tap_endpoint: string;
+}
+
+export interface GaiaCoordinates {
+  ra: number;
+  dec: number;
+  reference_epoch: number;
+  ra_error_mas?: number | null;
+  dec_error_mas?: number | null;
+}
+
+export interface GaiaAstrometry {
+  parallax_mas?: number | null;
+  parallax_error_mas?: number | null;
+  pmra_mas_yr?: number | null;
+  pmdec_mas_yr?: number | null;
+  pmra_error_mas_yr?: number | null;
+  pmdec_error_mas_yr?: number | null;
+  ruwe?: number | null;
+  ruwe_note?: string;
+}
+
+export interface GaiaPhotometry {
+  g?: number | null;
+  bp?: number | null;
+  rp?: number | null;
+}
+
+export interface GaiaSource {
+  catalog: string;
+  source_id: string;
+  coordinates: GaiaCoordinates;
+  astrometry: GaiaAstrometry;
+  photometry: GaiaPhotometry;
+  provenance: GaiaProvenance;
+}
+
+export interface GaiaConeSearchMetadata {
+  ra: number;
+  dec: number;
+  radius_arcsec: number;
+  magnitude_limit?: number | null;
+  limit: number;
+  total_found: number;
+  truncated: boolean;
+}
+
+export interface GaiaConeSearchResponse {
+  success: true;
+  catalog: string;
+  query: GaiaConeSearchMetadata;
+  sources: GaiaSource[];
+  separations_arcsec: number[];
+}
+
+export interface CrossMatchTarget {
+  external_id: string;
+  ra: number;
+  dec: number;
+  epoch?: number | null;
+  uncertainty_arcsec?: number | null;
+}
+
+export interface CrossMatchCandidate {
+  separation_arcsec: number;
+  separation_propagated_arcsec?: number | null;
+  source: GaiaSource;
+}
+
+export interface CrossMatchEpochInfo {
+  requested_epoch?: number | null;
+  gaia_reference_epoch: number;
+  propagated: boolean;
+  propagated_ra?: number | null;
+  propagated_dec?: number | null;
+  limitation?: string | null;
+}
+
+export interface CrossMatchResult {
+  external_id: string;
+  status: MatchStatus;
+  candidates: CrossMatchCandidate[];
+  best?: CrossMatchCandidate | null;
+  ambiguity_note?: string | null;
+  epoch: CrossMatchEpochInfo;
+}
+
+export interface CrossMatchConfig {
+  radius_arcsec?: number;
+  ambiguous_when_more_than?: number;
+  propagate_proper_motion?: boolean;
+  propagation_margin_arcsec?: number;
+}
+
+export interface CrossMatchRequest {
+  coordinates: CrossMatchTarget[];
+  config?: CrossMatchConfig;
+}
+
+export interface CrossMatchResponse {
+  success: true;
+  catalog: string;
+  config: CrossMatchConfig;
+  results: CrossMatchResult[];
+  matched: number;
+  ambiguous: number;
+  unmatched: number;
+}
+
+export interface GaiaSourceResponse {
+  success: true;
+  source: GaiaSource;
+}
+
+export interface GaiaAssociationCandidate {
+  gaia_source_id: string;
+  separation_arcsec: number;
+  separation_propagated_arcsec?: number | null;
+  source: GaiaSource;
+}
+
+export interface GaiaAssociationSignificance {
+  method: string;
+  assumptions: string[];
+  phase3_sigma_arcsec?: number | null;
+  gaia_sigma_arcsec?: number | null;
+  combined_sigma_arcsec?: number | null;
+  normalized_separation?: number | null;
+  match_p_value?: number | null;
+  limitation?: string | null;
+}
+
+export interface GaiaAssociationEpoch {
+  julian_year?: number | null;
+  basis?: string | null;
+  detection_count: number;
+  limitation?: string | null;
+}
+
+export interface SourceGaiaAssociationResponse {
+  success: true;
+  planetx_source_id: string;
+  reference_ra_deg: number;
+  reference_dec_deg: number;
+  status: MatchStatus;
+  candidates: GaiaAssociationCandidate[];
+  best?: GaiaAssociationCandidate | null;
+  ambiguity_note?: string | null;
+  config: CrossMatchConfig;
+  observation_epoch: GaiaAssociationEpoch;
+  propagation: CrossMatchEpochInfo;
+  significance: GaiaAssociationSignificance;
+  phase3?: Record<string, unknown> | null;
+  provenance?: GaiaProvenance | null;
+}
+
+export interface BandVariability {
+  band?: string | null;
+  expected_epochs: number;
+  non_detections: number;
+  metrics: VariabilityMetrics;
+}
+
+export interface SourceVariability {
+  source_id: string;
+  reference_ra_deg: number;
+  reference_dec_deg: number;
+  epoch_count: number;
+  bands: string[];
+  position_scatter_arcsec?: number | null;
+  band_metrics: BandVariability[];
+  flags: string[];
+}
+
+export interface SourceVariabilityResponse {
+  success: true;
+  source: SourceVariability;
+}
+
+export interface TargetVariabilityResponse {
+  success: true;
+  target: TargetCoordinates;
+  epochs_considered: number;
+  epochs_processed: number;
+  products_processed: number;
+  sources: SourceVariability[];
+  warnings: string[];
+}
+
+/** Search Gaia DR3 cone around coordinates */
+export async function searchGaia(params: {
+  ra: number;
+  dec: number;
+  radius_arcsec?: number;
+  magnitude_limit?: number;
+  limit?: number;
+}): Promise<GaiaConeSearchResponse> {
+  const query = new URLSearchParams({
+    ra: params.ra.toString(),
+    dec: params.dec.toString(),
+  });
+  if (params.radius_arcsec != null) query.set('radius_arcsec', params.radius_arcsec.toString());
+  if (params.magnitude_limit != null) query.set('magnitude_limit', params.magnitude_limit.toString());
+  if (params.limit != null) query.set('limit', params.limit.toString());
+
+  return request<GaiaConeSearchResponse>(`/api/v1/catalogs/gaia/search?${query.toString()}`);
+}
+
+/** Cross-match external coordinates against Gaia DR3 with proper motion propagation */
+export async function crossmatchGaia(payload: CrossMatchRequest): Promise<CrossMatchResponse> {
+  return request<CrossMatchResponse>('/api/v1/catalogs/gaia/crossmatch', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+}
+
+/** Retrieve exact Gaia DR3 record by source ID */
+export async function getGaiaSource(sourceId: string): Promise<GaiaSourceResponse> {
+  return request<GaiaSourceResponse>(`/api/v1/catalogs/gaia/${encodeURIComponent(sourceId)}`);
+}
+
+/** Retrieve Gaia DR3 association for a persisted Planet X source */
+export async function getSourceGaiaAssociation(sourceId: string): Promise<SourceGaiaAssociationResponse> {
+  return request<SourceGaiaAssociationResponse>(`/api/v1/sources/${encodeURIComponent(sourceId)}/catalogs`);
+}
+
+/** Retrieve variability evidence for a persisted source */
+export async function getSourceVariability(sourceId: string): Promise<SourceVariabilityResponse> {
+  return request<SourceVariabilityResponse>(`/api/v1/sources/${encodeURIComponent(sourceId)}/variability`);
+}
+
+/** Retrieve target-level variability summary */
+export async function getTargetVariability(payload: TargetLightCurveRequest): Promise<TargetVariabilityResponse> {
+  return request<TargetVariabilityResponse>('/api/v1/targets/variability', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
 }
 
 /** Helper to convert backend file paths into absolute URLs */

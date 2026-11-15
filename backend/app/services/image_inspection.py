@@ -325,6 +325,22 @@ def _psf_info(hdu: fits.BinTableHDU, pixel_scale_arcsec: float | None) -> PsfInf
     )
 
 
+def psf_summary(path: Path | str, pixel_scale_arcsec: float | None) -> PsfInfo:
+    """Read the EPSF extension of a product and summarise its median FWHM.
+
+    This is the same measurement ``inspect_fits`` reports, exposed for services
+    that need only the PSF and should not pay for a full inspection.
+    """
+    try:
+        with fits.open(Path(path), memmap=True) as hdul:
+            for hdu in hdul:
+                if str(hdu.name).upper() == "EPSF" and hdu.data is not None:
+                    return _psf_info(hdu, pixel_scale_arcsec)
+    except Exception as exc:  # pragma: no cover - defensive
+        log.warning("psf_read_failed", extra={"error": str(exc)})
+    return PsfInfo(available=False, message="No EPSF extension")
+
+
 def _half_max_width(profile: np.ndarray, center: int) -> float | None:
     """Width at half maximum of a 1-D cut through the PSF centre, in samples."""
     if not (0 <= center < profile.size):

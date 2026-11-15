@@ -185,7 +185,21 @@ def test_openapi_documents_all_public_routes(api) -> None:
         "/api/v1/images/inspect",
         "/api/v1/images/compare",
         "/api/v1/images/comparisons/{comparison_id}",
-        "/api/v1/files/{filename}",
+            "/api/v1/sources/detect",
+            "/api/v1/sources/photometry",
+            "/api/v1/sources/{source_id}",
+            "/api/v1/sources/{source_id}/catalogs",
+            "/api/v1/sources/{source_id}/lightcurve",                "/api/v1/sources/{source_id}/variability",
+                "/api/v1/sources/{source_id}/spectra",
+                "/api/v1/targets/lightcurve",
+                "/api/v1/targets/variability",
+                "/api/v1/spectra/extract",
+                "/api/v1/spectra/{spectrum_id}",
+                "/api/v1/spectra/compare",
+                "/api/v1/files/{filename}",
+                "/api/v1/catalogs/gaia/search",
+                "/api/v1/catalogs/gaia/crossmatch",
+                "/api/v1/catalogs/gaia/{source_id}",
     }
 
 

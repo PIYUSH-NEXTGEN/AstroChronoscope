@@ -71,6 +71,66 @@ if (comparison.status === "completed") {
 }
 ```
 
+Phase 3 (detection + aperture photometry + light curves):
+
+```ts
+// detect sources in one selected epoch/product
+const detection = await fetch(`${API_BASE}/sources/detect`, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ observation_id: observation.observation_id, ra: 156.09328159, dec: -41.64466331, size: 0.05 }),
+}).then(r => r.json());
+
+// aperture photometry (same fields; adds flux_jy / flux_jy_error)
+const photometry = await fetch(`${API_BASE}/sources/photometry`, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ observation_id: observation.observation_id, ra: 156.09328159, dec: -41.64466331, size: 0.05 }),
+}).then(r => r.json());
+
+// target light curve across epochs; keep max_observations small for a first call
+const curve = await fetch(`${API_BASE}/targets/lightcurve`, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({
+    ra: 156.09328159, dec: -41.64466331,
+    radius_deg: 0.05, cutout_size_deg: 0.05,
+    bands: ["SPHEREx-D3"], max_observations: 5,
+  }),
+}).then(r => r.json());
+// Render curve.sources[].series[] by band. Non-detections are counts, not zero flux.
+// Metrics are evidence, not a classification.
+```
+
+Phase 4 (DR1 cube spectra):
+
+```ts
+// Extract a spectrum at a target or at a persisted source id.
+const extracted = await fetch(`${API_BASE}/spectra/extract`, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ ra: 156.09328159, dec: -41.64466331 }),
+}).then(r => r.json());
+
+// Full ordered channel table for plotting.
+const spectrum = extracted.spectrum;
+// flux_unit === "MJy/sr", flux_kind === "surface_brightness"; null flux means blank/invalid.
+// uncertainty_mjy_sr is always null and quality.uncertainty_status === "NOT_VERIFIED".
+
+// Retrieve later / list by source.
+const stored = await fetch(`${API_BASE}/spectra/${spectrum.spectrum_id}`).then(r => r.json());
+const sourceSpectra = await fetch(`${API_BASE}/sources/${sourceId}/spectra`).then(r => r.json());
+
+// Compare two stored spectra by wavelength, not array index.
+const spectralComparison = await fetch(`${API_BASE}/spectra/compare`, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ spectrum_id_a: spectrum.spectrum_id, spectrum_id_b: otherId }),
+}).then(r => r.json());
+// Show comparison_basis, grid_compatible, quality and warnings. A different-product
+// comparison is NOT evidence of time variability: the cube is a static mosaic.
+```
+
 ---
 
 ## 2. Base URL, origin and file URLs
@@ -188,6 +248,17 @@ When an origin is not allowed, the preflight fails with HTTP 400 and no
 | `POST` | `/api/v1/images/inspect` | FITS/WCS/mask/variance/PSF inspection | ~5–60 s (cached instant) |
 | `POST` | `/api/v1/images/compare` | validated pairwise difference imaging | ~10–120 s (cached instant) |
 | `GET` | `/api/v1/images/comparisons/{comparison_id}` | stored comparison record | immediate |
+| `POST` | `/api/v1/sources/detect` | source detection in one product/cutout | ~5–60 s (cached instant) |
+| `POST` | `/api/v1/sources/photometry` | aperture photometry in one product/cutout | ~5–60 s (cached instant) |
+| `POST` | `/api/v1/targets/lightcurve` | multi-epoch detection, photometry and per-band light curves | ~30 s–several min (bounded by `max_observations`) |
+| `POST` | `/api/v1/targets/variability` | same bounded pipeline, per-band metrics without point arrays | same as light curve |
+| `GET` | `/api/v1/sources/{source_id}` | persisted internal source and detections | immediate |
+| `GET` | `/api/v1/sources/{source_id}/lightcurve` | persisted per-band light curve | immediate |
+| `GET` | `/api/v1/sources/{source_id}/variability` | persisted per-band variability metrics | immediate |
+| `POST` | `/api/v1/spectra/extract` | DR1 cube spectrum extraction | ~5 s cached / several min for a new 306 MiB tile |
+| `GET` | `/api/v1/spectra/{spectrum_id}` | stored spectrum + provenance | immediate |
+| `GET` | `/api/v1/sources/{source_id}/spectra` | spectrum summaries for one source | immediate |
+| `POST` | `/api/v1/spectra/compare` | wavelength-matched comparison of stored spectra | immediate |
 | `GET` | `/api/v1/files/{filename}` | serve generated preview/FITS | immediate |
 
 Search and cutout are `POST` because they carry parameters in a JSON body. There is no
@@ -611,6 +682,270 @@ Returns the stored comparison record (same schema as the compare response). Use 
 re-render a previous result or to recover after a page reload. The id is the 32-hex
 prefix of the deterministic cache key. Unknown/malformed ids → `404 COMPARISON_NOT_FOUND`.
 
+### 5.11 `POST /sources/detect`
+
+Detects compact sources in one product/cutout.
+
+```ts
+{
+  observation_id: string;      // required; opaque id
+  ra?: number;                 // optional, must be paired with dec
+  dec?: number;
+  size?: number;               // cutout size in degrees; ignored without ra/dec
+  config?: {
+    threshold_sigma?: number;  // default 5 (1-20)
+    min_area_px?: number;      // default 5
+    max_sources?: number;      // default 500
+    filter_fwhm_px?: number;   // default 1.5
+    edge_margin_px?: number;   // default 2
+    background_mesh?: number;  // default 4
+    deblend?: boolean;         // default true
+  };
+}
+```
+
+Key response fields:
+
+- `image`: shape, `BUNIT`, valid/masked pixel counts, pixel scale/solid angle, PSF FWHM.
+- `background`: `method`, `level`, `sigma`, `reliable`.
+- `detections[]`: `detection_id`, `x`/`y`, `ra_deg`/`dec_deg`, `peak_value` (native
+  pixel value, **not flux**), `source_area`, `centroid_x`/`centroid_y`, `detection_snr`,
+  `centroid_error_px`/`centroid_error_arcsec` (approximate statistical centroid error,
+  not full astrometric uncertainty), `fwhm_px`/`fwhm_arcsec`, `blended`, `flags`,
+  `quality`.
+- `total_detections`, `truncated`, `quality.overall_status` (`PASS`/`WARNING`/`FAIL`/
+  `NOT_VERIFIED`), `provenance`.
+
+`ra`/`dec` must be supplied together; supplying neither analyses the full product
+(slower, larger). Empty `detections` is a valid result. Render `quality` and `flags`;
+do not treat every detection as a confirmed source.
+
+### 5.12 `POST /sources/photometry`
+
+Same request fields as `/sources/detect`, plus optional `photometry`:
+
+```ts
+{
+  observation_id: string;
+  ra?: number;
+  dec?: number;
+  size?: number;
+  detection?: DetectionConfig;
+  photometry?: {
+    aperture_fwhm_factor?: number;   // default 3
+    annulus_inner_factor?: number;   // default 1.3
+    annulus_outer_factor?: number;   // default 2.0
+    aperture_oversample?: number;    // default 8
+    min_valid_fraction?: number;     // default 0.5
+  };
+}
+```
+
+`measurements[]` adds, per detection: `centroid_error_px`/`centroid_error_arcsec`,
+`aperture_radius_px`, `aperture_valid_fraction`, `psf_fwhm_px`/`fwhm_source`,
+`aperture_sum` and `aperture_sum_unit` (native), `background_level`/`background_method`,
+`solid_angle_sr`, `flux_mjy`, `flux_jy`, `flux_jy_error`, `snr`, `uncertainty_method`,
+`aperture_correction_applied` (always `false`) and `quality`.
+
+- Plot/filter on `flux_jy`; show `aperture_valid_fraction`, `quality` and `flags`.
+- `flux_jy` is `null` when units cannot be converted; do not substitute the native sum.
+- `snr` is per-measurement, not a variability significance.
+- Invalid pixels are excluded, never zero-filled. Negative flux is preserved.
+
+### 5.13 `POST /targets/lightcurve`
+
+```ts
+{
+  ra: number;
+  dec: number;
+  radius_deg?: number;       // archive search radius, default 0.05
+  cutout_size_deg?: number;  // image cutout, default 0.1
+  collection?: string;
+  bands?: string[];
+  start_date?: string;
+  end_date?: string;
+  max_observations?: number; // default 20, max 200
+  detection?: DetectionConfig;
+  photometry?: PhotometryConfig;
+  association?: {
+    match_radius_arcsec?: number;            // default 6
+    ambiguity_margin_arcsec?: number;        // default 1
+    position_uncertainty_sigma?: number;     // default 3
+    max_uncertainty_boost_arcsec?: number;   // default 3
+    min_epochs?: number;                     // default 2
+    max_sources?: number;                    // default 100
+  };
+}
+```
+
+Response fields:
+
+- `epochs_considered`, `epochs_processed`, `products_processed`.
+- `sources[]`: `source_id` (internal, not a catalogue id), reference RA/Dec,
+  `epoch_count`, `bands`, `position_scatter_arcsec`, `flags`.
+- `sources[].series[]`: one series per band with `points[]`, `expected_epochs`,
+  `non_detections` and `metrics`.
+- `points[]`: `time_utc`, `time_mjd`, `flux_jy`, `flux_jy_error`, `unit` (`"Jy"`),
+  `band`, `observation_id`, `detection_id`, `snr`, `quality`, `flags`.
+- `metrics`: `status` (`computed`/`insufficient_data`/`undefined_uncertainties`),
+  `n_points`, mean/median/weighted mean, std/MAD/robust sigma,
+  `fractional_variability`, `chi2`/`dof`/`reduced_chi2`/`chi2_pvalue`,
+  `peak_to_peak_jy`, `robust_range_jy`, `temporal_baseline_days`, `max_gap_days`.
+- `failures[]`: per-epoch failures (`code`, `message`) - show them, do not hide them.
+- `association.below_min_epoch_source_ids[]`: retained sources that do not meet
+  `min_epochs`; they are retrievable by id but are not light-curve entries.
+- `association.multi_epoch_sources`, `below_min_epoch_sources`, `sources_truncated`:
+  counts after the `max_sources` bound. `matched.candidates[]` ranks alternatives and
+  marks the selected association.
+
+Rules:
+
+- One product is selected per epoch; all requested bands for that epoch stay together.
+  Bands are never merged into one series.
+- Non-detections are counts, not zero flux or upper limits.
+- The association radius is expanded by centroid uncertainty (bounded), and ambiguous
+  matches are flagged rather than silently resolved.
+- Metrics are evidence, not a classification. Do not label a source "variable",
+  "transient" or "confirmed" from this response.
+- The endpoint is synchronous and bounded by `max_observations` epochs; show a loading
+  state, start with a small value, and let the user retry. No job id/progress stream
+  exists.
+
+### 5.14 `GET /sources/{source_id}`
+
+Returns the persisted internal source, including every associated detection, candidate
+ranking, quality flags, the original target/query and provenance. Source ids are
+32-character lowercase hex and are validated before any filesystem access. Unknown or
+malformed ids return `404 SOURCE_NOT_FOUND`; an unreadable stored record returns
+`500 SOURCE_STORAGE_ERROR`.
+
+Persisted records survive process restarts and cache expiry. A below-`min_epochs`
+source is still returned with its detections and is not treated as a light curve.
+
+### 5.15 `GET /sources/{source_id}/lightcurve`
+
+Returns the persisted per-band series and metrics for one source. A below-minimum
+source returns `series: []` with `below_min_epochs` and `no_light_curve` flags; do not
+invent flux or upper limits.
+
+### 5.16 `POST /targets/variability` and `GET /sources/{source_id}/variability`
+
+`POST /targets/variability` takes the same body as `/targets/lightcurve` and returns
+per-band `band_metrics[]` without duplicating point arrays. `GET
+/sources/{source_id}/variability` returns the same source-level object for one stored
+source. Use these for a compact review table; fetch the light curve separately when
+plotting. Metrics remain evidence, not classification.
+
+### 5.17 `POST /spectra/extract`
+
+Body fields: `source_id` **or** (`ra`, `dec`) — mutually exclusive; optional
+`collection` and `config.spatial_method` (`bilinear` default or `nearest`). Unknown
+fields are rejected. `source_id` resolves the reference position from the persisted
+Phase 3 source.
+
+Response `200`:
+
+```json
+{
+  "success": true,
+  "spectrum": {
+    "spectrum_id": "29891c5bfbcd874dc23126ae179fbbf8",
+    "source_id": null,
+    "product_type": "spherex_dr1_all_sky_cube",
+    "collection": "spherex_dr1_cube",
+    "product_id": "ivo://irsa.ipac/spherex_dr1_cube?hips5_cube-hips_20261026/9621",
+    "ra_deg": 156.09328159,
+    "dec_deg": -41.64466331,
+    "pixel_x": 282.099,
+    "pixel_y": 229.071,
+    "wavelength_unit": "um",
+    "flux_unit": "MJy/sr",
+    "flux_kind": "surface_brightness",
+    "channel_count": 102,
+    "valid_channel_count": 100,
+    "blank_channels": [50, 51],
+    "channels": [
+      {
+        "index": 0,
+        "wavelength_um": 0.753,
+        "flux_mjy_sr": 0.0933,
+        "uncertainty_mjy_sr": null,
+        "nhits": 13,
+        "flags": 2097152,
+        "flags_applied": [],
+        "quality": "PASS"
+      }
+    ],
+    "quality": {
+      "overall_status": "WARNING",
+      "uncertainty_status": "NOT_VERIFIED",
+      "warnings": ["cube_is_static_mosaic", "no_variance_extension", "blank_channels_present"]
+    },
+    "limitations": ["cube_is_static_mosaic", "surface_brightness_not_integrated_flux"]
+  },
+  "provenance": {
+    "created_at": "2026-11-15T00:00:00+00:00",
+    "algorithm_version": "phase4-spectrum-extraction-v1",
+    "access_url": "https://irsa.ipac.caltech.edu/ibe/data/spherex/dr1/...Npix9621_cube.fits",
+    "fits_sha256": "...",
+    "npix": 9621,
+    "order": 5
+  }
+}
+```
+
+The first request for a tile downloads roughly 306 MiB and is synchronous; give it a
+long client timeout and show a loading state. Subsequent requests use the disk cache.
+Flux is surface brightness, not total source flux. Blank/invalid channels have null
+flux and a non-`PASS` quality; never render them as measured zero.
+
+### 5.18 `GET /spectra/{spectrum_id}`
+
+Returns the same `spectrum` + `provenance` shape. Unknown/malformed ids return
+`404 SPECTRUM_NOT_FOUND`; corrupt stored JSON returns `500 SPECTRUM_STORAGE_ERROR`.
+
+### 5.19 `GET /sources/{source_id}/spectra`
+
+```json
+{
+  "success": true,
+  "source_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "spectra": [
+    {
+      "spectrum_id": "29891c5bfbcd874dc23126ae179fbbf8",
+      "source_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "collection": "spherex_dr1_cube",
+      "product_id": "ivo://irsa.ipac/spherex_dr1_cube?...",
+      "ra_deg": 156.09328159,
+      "dec_deg": -41.64466331,
+      "valid_channel_count": 100,
+      "channel_count": 102,
+      "wavelength_min_um": 0.753,
+      "wavelength_max_um": 4.988,
+      "quality": "WARNING",
+      "created_at": "2026-11-15T00:00:00+00:00"
+    }
+  ]
+}
+```
+
+Listings omit channel arrays; fetch the full spectrum by id. Unknown source ids return
+`404 SOURCE_NOT_FOUND`.
+
+### 5.20 `POST /spectra/compare`
+
+Body: `spectrum_id_a`, `spectrum_id_b`, optional `config.min_overlap_channels`
+(default 5) and `config.wavelength_tolerance_um` (default `1e-4`).
+
+Response `comparison` includes `comparison_basis`, `grid_compatible`,
+`overlap_channel_count`, `channels[]` with `difference_mjy_sr` and `ratio`, plus
+`quality` and `warnings`. Possible bases: `same_spectrum`,
+`same_product_static_mosaic`, `different_products_static_mosaic`.
+
+A different-product comparison is **not** a spectral time series: the DR1 cube is a
+static mosaic and has no epoch or variance. `uncertainty_status` is always
+`NOT_VERIFIED`; low overlap returns `FAIL`, sufficient overlap returns `WARNING`.
+
 ---
 
 ## 6. Observation identifiers
@@ -651,6 +986,27 @@ step 2. Render `epochs[]` in order and use each product's `observation_id` for t
 existing detail/cutout calls. Do not infer comparability from multiple epochs; the
 response explicitly sets `metadata.comparability_assessed = false`.
 
+For Phase 3, call `POST /targets/lightcurve` with the target and a small
+`max_observations` (for example 5) to get per-band series. Render `points[]` with error
+bars, group by `series[].band`, and show `series[].non_detections`, `metrics.status`,
+`failures[]`, quality and provenance. Do not join bands into one series and do not
+present a metric or a candidate pattern as a confirmed astrophysical event. The call is
+synchronous, so keep a loading/retry state and increase `max_observations` deliberately.
+For one epoch only, `POST /sources/detect` and `/sources/photometry` expose the same
+measurements without the timeline/association step.
+
+To inspect one associated source, use `GET /sources/{source_id}` and
+`GET /sources/{source_id}/lightcurve`. Use `POST /targets/variability` or
+`GET /sources/{source_id}/variability` when only the metrics table is needed. Persisted
+ids remain valid after a backend restart, and ids below `min_epochs` are still
+retrievable for review.
+
+For Phase 4, call `POST /spectra/extract` with the target coordinates or a persisted
+`source_id`. Plot `spectrum.channels[]` against `wavelength_um`, skipping null flux, and
+show `quality`, `blank_channels`, `flags_applied` and `limitations`. Use
+`GET /sources/{source_id}/spectra` for the source tab. Comparisons are static-mosaic
+comparisons, not light curves: show `comparison_basis` and warnings prominently.
+
 ---
 
 ## 8. Errors
@@ -677,14 +1033,21 @@ to end users; map them to friendly text and offer retry where sensible.
 | 404 | `OBSERVATION_NOT_FOUND` | id is stale/unknown → re-run search |
 | 404 | `COMPARISON_NOT_FOUND` | comparison id unknown/malformed/evicted → re-run the comparison |
 | 404 | `FILE_NOT_FOUND` | cached file missing/removed → re-request cutout |
+| 404 | `SPECTRAL_PRODUCT_NOT_FOUND` | no DR1 cube covers that position → try another target |
+| 404 | `SPECTRUM_NOT_FOUND` | spectrum id unknown/malformed → re-extract |
 | 422 | `INVALID_REQUEST` | request schema bug (unknown field, wrong type) |
+| 422 | `SPECTRAL_PRODUCT_UNSUPPORTED`, `SPECTRAL_TARGET_OUTSIDE_PRODUCT`, `SPECTRAL_EXTRACTION_FAILED` | spectral product cannot produce a spectrum at this position |
 | 422 | `MISSING_ACCESS_URL`, `UNTRUSTED_ACCESS_URL`, `UNSUPPORTED_PRODUCT`, `MISSING_IMAGE_EXTENSION` | this product cannot be displayed |
 | 422 | `IMAGE_PROCESSING_LIMIT` | pair exceeds `MAX_COMPARISON_PIXELS` → use a smaller `size` |
 | 422 | `REPROJECTION_FAILED` | WCS transform/interpolation failed → try another pair |
 | 502 | `IRSA_HTTP_ERROR`, `IRSA_INVALID_RESPONSE`, `IRSA_QUERY_ERROR`, `INVALID_FITS_FILE` | upstream/data error → retry |
 | 503 | `IRSA_UNAVAILABLE`, `IRSA_CUTOUT_UNAVAILABLE` | upstream busy → retry later |
-| 503 | `PROCESSING_BUSY` | too many comparisons in flight → retry shortly |
+| 503 | `SPECTRAL_PRODUCT_UNAVAILABLE` | cube archive temporarily unavailable → retry later |
+| 503 | `PROCESSING_BUSY` | too many comparisons/extractions in flight → retry shortly |
 | 504 | `IRSA_TIMEOUT` | upstream slow → retry |
+| 404 | `SOURCE_NOT_FOUND` | source id unknown/malformed �+' re-run the target pipeline or use an id from the current response |
+| 500 | `SOURCE_STORAGE_ERROR` | persisted source record is corrupt/unreadable �+' report; do not fabricate source data |
+| 500 | `SPECTRUM_STORAGE_ERROR` | persisted spectrum JSON is corrupt/unreadable �+' report; re-extract if possible |
 | 500 | `PREVIEW_GENERATION_FAILED`, `INTERNAL_ERROR` | retry / report |
 
 Framework-level errors (`HTTP_ERROR`): unknown route (`404`) and wrong method (`405`)
@@ -877,19 +1240,30 @@ curl -s http://localhost:8000/api/v1/images/comparisons/<comparison_id> | jq '{s
 
 Do not build UI on top of features that do not exist in this backend:
 
-- light curves or time-series analysis
-- source detection / catalogue photometry / significance maps
-- spectral extraction or spectral cubes
-- deconvolution or image-based re-registration (alignment is validated, not corrected)
+- PSF photometry, forced photometry or deblending beyond the simple local-maximum split
+- multi-epoch spectra, SED fitting, spectral slope fitting or physical feature claims
+- spectral-image extraction (only the DR1 all-sky cube is a supported spectrum)
+- image-based re-registration / deconvolution (alignment is validated, not corrected)
+- candidate classification, transient confirmation or significance maps
+- background jobs, progress streams or cancellation for long analyses
 - authentication, quotas, or per-user storage
 
 Implemented: multi-epoch discovery (`GET /targets/timeline`), single-epoch retrieval,
 metadata, WCS validation, previews, FITS inspection (`POST /images/inspect`), validated
-pairwise difference imaging (`POST /images/compare`) and stored comparison records
-(`GET /images/comparisons/{id}`).
+pairwise difference imaging (`POST /images/compare`), stored comparison records
+(`GET /images/comparisons/{id}`), source detection (`POST /sources/detect`), aperture
+photometry (`POST /sources/photometry`), target light curves with variability metrics
+(`POST /targets/lightcurve`, `POST /targets/variability`), persisted source detail /
+light-curve / variability views (`GET /sources/{id}`, `/lightcurve`, `/variability`),
+and DR1 cube spectra with extraction, retrieval, source listing and comparison
+(`POST /spectra/extract`, `GET /spectra/{id}`, `GET /sources/{id}/spectra`,
+`POST /spectra/compare`).
 
 For comparison UIs: render `quality.checks` rather than only the image, and never treat
 HTTP `200` as "the science passed" — check `status` / `scientifically_valid`.
+For detection/photometry/light-curve UIs: render quality flags and provenance, do not
+call a detection a confirmed source, and do not call a variability metric a
+classification.
 
 ---
 
@@ -909,6 +1283,15 @@ HTTP `200` as "the science passed" — check `status` / `scientifically_valid`.
 | `503 IRSA_CUTOUT_UNAVAILABLE` | IRSA IBE busy | retry after a few seconds |
 | `404 FILE_NOT_FOUND` | cached file removed | re-request the cutout |
 | `404 COMPARISON_NOT_FOUND` | comparison id typo / record not on this host | re-run the comparison; ids are per-backend-instance |
+| `404 SOURCE_NOT_FOUND` | source id typo / not produced by this backend | use an id from a current target response; ids are 32 lowercase hex characters |
+| `500 SOURCE_STORAGE_ERROR` | persisted source JSON is corrupt or unreadable | report the id; do not display guessed source data |
+| `404 SPECTRAL_PRODUCT_NOT_FOUND` | no DR1 cube covers the target | try another position or collection |
+| `404 SPECTRUM_NOT_FOUND` | spectrum id typo / not stored on this backend | extract again and use the returned `spectrum_id` |
+| `422 SPECTRAL_TARGET_OUTSIDE_PRODUCT` | target lies outside the retrieved cube tile WCS | use a position inside the tile |
+| `503 SPECTRAL_PRODUCT_UNAVAILABLE` | cube archive busy/unreachable | retry later |
+| `503 PROCESSING_BUSY` | `MAX_CONCURRENT_SPECTRAL` saturated | retry after a few seconds |
+| Spectrum has `uncertainty_mjy_sr: null` | the DR1 cube has no `VARIANCE` extension | expected; show "uncertainty not available", not zero error |
+| Spectral comparison `overall_status: "FAIL"` | fewer than `min_overlap_channels` matched wavelengths | show the warning; do not invent a comparison |
 | `422 IMAGE_PROCESSING_LIMIT` | pair exceeds `MAX_COMPARISON_PIXELS` | reduce `size` (0.2° is the default; 0.1° is a quarter of the pixels) |
 | `422 REPROJECTION_FAILED` | one product's WCS could not be transformed onto the other grid | try a different pair; report the ids |
 | `503 PROCESSING_BUSY` | `MAX_CONCURRENT_COMPARISONS` saturated | retry after a few seconds |

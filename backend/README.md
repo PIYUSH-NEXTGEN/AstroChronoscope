@@ -3,16 +3,25 @@
 Backend for an interactive SPHEREx time-domain sky explorer. It retrieves **genuine** SPHEREx
 observations from NASA/IPAC IRSA, downloads real spatial cutouts, extracts the science
 `IMAGE` extension, validates celestial WCS, renders PNG previews, discovers multi-epoch
-timelines, inspects FITS products and compares two epochs on a common celestial grid —
-all through a small JSON API.
+timelines, inspects FITS products, compares two epochs on a common celestial grid, and
+measures sources across epochs into per-band light curves, all through a small JSON API.
 
 No mock observations, no synthetic FITS, no hardcoded observation metadata.
 
-> Scope note: **Phase 1 multi-epoch discovery** (`GET /api/v1/targets/timeline`) and
+> Scope note: **Phase 1 multi-epoch discovery** (`GET /api/v1/targets/timeline`),
 > **Phase 2 FITS inspection + pairwise image comparison** (`POST /api/v1/images/inspect`,
-> `POST /api/v1/images/compare`, `GET /api/v1/images/comparisons/{id}`) are implemented.
-> Light curves, catalogue photometry, spectral extraction and variability detection
-> remain **out of scope** (Phase 3+).
+> `POST /api/v1/images/compare`, `GET /api/v1/images/comparisons/{id}`) and
+> **Phase 3 source detection + aperture photometry + light curves**
+> (`POST /api/v1/sources/detect`, `POST /api/v1/sources/photometry`,
+> `POST /api/v1/targets/lightcurve`, `POST /api/v1/targets/variability`,
+> `GET /api/v1/sources/{id}`, `/lightcurve`, `/variability`) and **Phase 4 DR1 cube
+> spectral extraction + comparison** (`POST /api/v1/spectra/extract`,
+> `GET /api/v1/spectra/{id}`, `GET /api/v1/sources/{id}/spectra`,
+> `POST /api/v1/spectra/compare`) and **Phase 5 Gaia DR3 catalog integration**
+> (`GET /api/v1/catalogs/gaia/search`, `POST /api/v1/catalogs/gaia/crossmatch`,
+> `GET /api/v1/catalogs/gaia/{source_id}`, see `docs/GAIA_INTEGRATION.md`) are
+> implemented. PSF photometry, forced photometry, multi-epoch spectra and candidate
+> classification remain **out of scope**.
 
 ---
 
@@ -61,6 +70,9 @@ app/
     cutout.py              Cutout request/response + WCS info
     timeline.py            Multi-epoch timeline response models
     image_processing.py    Inspection + comparison request/response models
+    sources.py             Detection request/response, quality and provenance models
+    photometry.py          Aperture-photometry request/response and flux models
+    lightcurve.py          Association, light-curve and variability models
   services/
     irsa_client.py         SIA2 HTTP, VOTable parsing, ID lookup, retries/timeouts
     observation_service.py Mapping SIA rows → API models, caching, orchestration
@@ -72,11 +84,22 @@ app/
     image_inspection.py    HDU/WCS/mask/variance/PSF extraction, image statistics
     image_reprojection.py  Common-grid resampling + phase-correlation alignment check
     image_comparison.py    Prerequisite checks, difference imaging, quality, provenance
+    artifact_resolver.py   Shared cutout/product resolution for Phases 2 and 3
+    versions.py            Software/version provenance recorded on derived records
+    image_preparation.py   Validity mask, background/noise, PSF and pixel solid angle
+    source_detection.py    Masked matched filter, segmentation, deblending, centroids
+    photometry.py          Circular aperture photometry and MJy/sr → Jy conversion
+    source_association.py  Angular association, candidate ranking and source ids
+    source_catalog.py      Persisted source detail, light-curve and variability views
+    variability.py         Light-curve statistics (F_var, χ², MAD, baseline, gaps)
+    lightcurve_service.py  Timeline → detection → photometry → association → series
   api/
     deps.py                Singletons: settings, HTTP client, cache store, service
     observation_routes.py  /observations/*
     timeline_routes.py     /targets/timeline
     image_routes.py        /images/inspect, /images/compare, /images/comparisons/*
+    source_routes.py       /sources/detect, /sources/photometry, /sources/{id}(/*)
+    lightcurve_routes.py   /targets/lightcurve, /targets/variability
     file_routes.py         /files/* (hash-name allowlist, no traversal)
 tests/
   test_*.py                Deterministic unit/API tests (no network)
@@ -122,6 +145,31 @@ POST /api/v1/images/compare
   → background + optional photometric scale → D = I_b - alpha*I_a
   → write difference/uncertainty/mask FITS + PNG → quality + provenance
   → persist /api/v1/images/comparisons/<id>
+
+POST /api/v1/sources/detect
+  → resolve product + shared cutout → validate WCS/coverage/mask/units
+  → sigma-clipped background + noise → masked matched filter
+  → threshold + connected components + deblend → flux-weighted centroids
+  → WCS sky positions → per-source quality flags → JSON catalogue
+
+POST /api/v1/sources/photometry
+  → resolve the same product/cutout → detect sources (cached)
+  → circular aperture + annulus background for every detection
+  → variance-aware uncertainty → MJy/sr → Jy via pixel solid angle
+  → quality/coverage flags → JSON measurements
+
+POST /api/v1/targets/lightcurve
+  → cached SIA search + timeline → choose one product per epoch (all requested bands)
+  → detect + photometer every epoch (bounded) → uncertainty-aware angular association
+  → per-band series → count non-detections → variability metrics (not classification)
+  → per-epoch failures and provenance → JSON light curves
+  -> persist source/light-curve records
+
+POST /api/v1/targets/variability
+  -> same bounded pipeline/caches -> per-band metrics without point arrays
+
+GET /api/v1/sources/{id}, /sources/{id}/lightcurve, /sources/{id}/variability
+  -> TTL cache or storage/sources/<id>.json -> persisted source, detections, series, metrics
 ```
 
 Each SIA row is a **product**, not an independent observation. SPHEREx returns one row
@@ -217,6 +265,18 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `PSF_WARN_RATIO` | `1.15` | PSF FWHM ratio above which compatibility is a warning |
 | `PSF_FAIL_RATIO` | `1.4` | PSF FWHM ratio above which direct subtraction is refused |
 | `MAX_CONCURRENT_COMPARISONS` | `2` | Bounded concurrency for comparison processing |
+| `DETECTION_THRESHOLD_SIGMA` | `5.0` | Default source-detection threshold (smoothed background σ) |
+| `DETECTION_MIN_AREA_PX` | `5` | Minimum connected area for a detection |
+| `DETECTION_MAX_SOURCES` | `500` | Maximum sources returned per image (brightest first) |
+| `DETECTION_FILTER_FWHM_PX` | `1.5` | Matched-filter FWHM in pixels |
+| `DETECTION_EDGE_MARGIN_PX` | `2` | Border margin that marks a source as edge-affected |
+| `DETECTION_BACKGROUND_MESH` | `4` | Mesh cells per axis for background-variation checks |
+| `PHOTOMETRY_APERTURE_FWHM_FACTOR` | `3.0` | Aperture radius in units of the PSF FWHM |
+| `PHOTOMETRY_ANNULUS_INNER_FACTOR` | `1.3` | Annulus inner radius / aperture radius |
+| `PHOTOMETRY_ANNULUS_OUTER_FACTOR` | `2.0` | Annulus outer radius / aperture radius |
+| `PHOTOMETRY_APERTURE_OVERSAMPLE` | `8` | Sub-pixels per axis for fractional aperture areas |
+| `PHOTOMETRY_MIN_VALID_FRACTION` | `0.5` | Minimum valid-pixel fraction inside an aperture |
+| `MAX_CONCURRENT_DETECTIONS` | `2` | Bounded concurrency for detection processing |
 | `LOG_LEVEL` | `INFO` | Log level |
 | `CORS_ORIGINS` | `["http://localhost:3000","http://127.0.0.1:3000","http://localhost:5173","http://127.0.0.1:5173"]` | Explicit browser origins (JSON tuple). `"*"` is rejected at startup. |
 
@@ -943,6 +1003,522 @@ is the 32-hex prefix of the cache key. Unknown or malformed ids return
 curl -s http://localhost:8000/api/v1/images/comparisons/<comparison_id>
 ```
 
+### 4.11 `POST /sources/detect`
+
+Detects compact sources in one SPHEREx product or cutout. Source detection is a
+**measurement**, not a classification: `peak_value` is a native pixel value, not an
+integrated flux.
+
+Request:
+
+```json
+{
+  "observation_id": "<observation_id>",
+  "ra": 156.09328159,
+  "dec": -41.64466331,
+  "size": 0.05,
+  "config": {
+    "threshold_sigma": 5.0,
+    "min_area_px": 5,
+    "max_sources": 500,
+    "filter_fwhm_px": 1.5,
+    "edge_margin_px": 2,
+    "background_mesh": 4,
+    "deblend": true
+  }
+}
+```
+
+- `ra`/`dec` must be supplied together. Omitting both inspects the **full product**
+  (slower and larger); supplying both requests a cutout of `size` degrees.
+- `size` defaults to `COMPARISON_SIZE_DEG` and is bounded by `MAX_CUTOUT_SIZE_DEG`.
+- Detection is performed on a validity mask; NaNs, infinite values and mask-flagged
+  pixels are never treated as zero.
+- The matched filter is noise-normalised; deblending splits components with multiple
+  local maxima above 25% of the component peak. This is a documented baseline, not a
+  universal setting.
+
+Response (abridged; values are illustrative):
+
+```json
+{
+  "success": true,
+  "observation_id": "<observation_id>",
+  "source": "cutout",
+  "target": { "ra": 156.09328159, "dec": -41.64466331 },
+  "size_deg": 0.05,
+  "image": {
+    "shape": [58, 59],
+    "science_extname": "IMAGE",
+    "bunit": "MJy / sr",
+    "valid_pixels": 3300,
+    "valid_fraction": 0.96,
+    "variance_available": true,
+    "pixel_scale_arcsec": 6.15,
+    "pixel_solid_angle_sr": 9.04e-10,
+    "psf_fwhm_arcsec": 6.2
+  },
+  "background": {
+    "method": "sigma_clipped_median",
+    "level": 0.31,
+    "sigma": 0.004,
+    "reliable": true
+  },
+  "detections": [
+    {
+      "detection_id": "det-...",
+      "source_id": null,
+      "x": 28.7,
+      "y": 28.8,
+      "ra_deg": 156.0932,
+      "dec_deg": -41.6446,
+      "peak_value": 1.42,
+      "source_area": 17,
+      "centroid_x": 28.7,
+      "centroid_y": 28.8,
+      "detection_snr": 42.1,
+      "centroid_error_px": 0.05,
+      "centroid_error_arcsec": 0.31,
+      "fwhm_px": 2.05,
+      "fwhm_arcsec": 12.6,
+      "background_level": 0.31,
+      "noise_sigma": 0.004,
+      "blended": false,
+      "flags": [],
+      "quality": "PASS"
+    }
+  ],
+  "total_detections": 1,
+  "truncated": false,
+  "quality": { "overall_status": "PASS", "warnings": [] },
+  "provenance": {
+    "algorithm": "masked_matched_filter",
+    "algorithm_version": "phase3-source-detection-v1",
+    "fits_sha256": "<sha256>",
+    "cache_key": "<key>",
+    "config": {}
+  }
+}
+```
+
+`quality.overall_status` is `PASS`, `WARNING`, `FAIL` or `NOT_VERIFIED`. An empty
+`detections` list is a valid result; it does not imply the image was unusable.
+
+### 4.12 `POST /sources/photometry`
+
+Runs detection, then measures circular-aperture photometry for every detection in the
+same cutout. SPHEREx `IMAGE` pixels are surface brightness, so the response reports
+both the native aperture sum and the integrated flux.
+
+Request: same fields as `/sources/detect`, plus optional `photometry`:
+
+```json
+{
+  "observation_id": "<observation_id>",
+  "ra": 156.09328159,
+  "dec": -41.64466331,
+  "size": 0.05,
+  "photometry": {
+    "aperture_fwhm_factor": 3.0,
+    "annulus_inner_factor": 1.3,
+    "annulus_outer_factor": 2.0,
+    "aperture_oversample": 8,
+    "min_valid_fraction": 0.5
+  }
+}
+```
+
+Response (abridged; values are illustrative):
+
+```json
+{
+  "success": true,
+  "observation_id": "<observation_id>",
+  "measurements": [
+    {
+      "detection_id": "det-...",
+      "observation_id": "<observation_id>",
+      "band": "SPHEREx-D3",
+      "observation_time": "2026-05-17T06:32:37.132800+00:00",
+      "centroid_error_px": 0.05,
+      "centroid_error_arcsec": 0.31,
+      "aperture_radius_px": 6.15,
+      "aperture_valid_fraction": 1.0,
+      "psf_fwhm_px": 2.05,
+      "fwhm_source": "psf",
+      "aperture_sum": 1.51,
+      "aperture_sum_unit": "MJy / sr",
+      "background_level": 0.31,
+      "background_method": "annulus_sigma_clipped",
+      "solid_angle_sr": 9.04e-10,
+      "flux_mjy": 0.00137,
+      "flux_jy": 1.37e-6,
+      "flux_jy_error": 4.2e-8,
+      "snr": 32.6,
+      "uncertainty_method": "variance_array",
+      "aperture_correction_applied": false,
+      "measurement_method": "circular_aperture",
+      "quality": "PASS"
+    }
+  ],
+  "total_measurements": 1,
+  "quality": "PASS",
+  "warnings": []
+}
+```
+
+- Conversion: `flux_jy = aperture_sum × solid_angle_sr × 1e6` when `BUNIT` is MJy/sr.
+  `solid_angle_sr` is the constant projection-plane pixel area derived from the WCS.
+- No aperture correction or PSF correction is applied (`aperture_correction_applied` is
+  always `false`). The aperture may therefore miss extended wings; this is recorded,
+  not hidden.
+- Invalid/non-finite pixels are excluded and lower `aperture_valid_fraction`; they are
+  never zero-filled. A negative background-subtracted flux is preserved.
+- `flux_jy`/`flux_mjy` are `null` for unsupported units; the native sum is still shown.
+- `snr` is a per-measurement signal-to-noise ratio, **not** a variability significance.
+- `quality` reflects coverage, background/variance availability and edge/blend flags.
+
+### 4.13 `POST /targets/lightcurve`
+
+End-to-end Phase 3 pipeline: SIA discovery -> timeline -> one product per epoch (all
+requested bands) -> detection -> aperture photometry -> uncertainty-aware angular
+association -> per-band light curves and variability metrics.
+
+Request:
+
+```json
+{
+  "ra": 156.09328159,
+  "dec": -41.64466331,
+  "radius_deg": 0.05,
+  "cutout_size_deg": 0.1,
+  "collection": "spherex_qr3",
+  "bands": ["SPHEREx-D3"],
+  "start_date": null,
+  "end_date": null,
+  "max_observations": 20,
+  "association": {
+    "match_radius_arcsec": 6.0,
+    "ambiguity_margin_arcsec": 1.0,
+    "position_uncertainty_sigma": 3.0,
+    "max_uncertainty_boost_arcsec": 3.0,
+    "min_epochs": 2,
+    "max_sources": 100
+  }
+}
+```
+
+- `radius_deg` is the **archive search** radius; `cutout_size_deg` is the **image**
+  cutout around the target. They are deliberately separate.
+- `max_observations` bounds **epochs** per request (`1-200`), keeping all requested
+  bands for each selected epoch. The endpoint is synchronous: the first call can
+  download many cutouts, so use a small `max_observations` and a loading state. Repeated
+  identical requests reuse the detection/photometry caches.
+- `bands` is an optional exact filter. Different bands are never merged into one
+  series.
+- `match_radius_arcsec` is the base angular radius (great-circle separation).
+  `position_uncertainty_sigma` expands it by each detection's approximate centroid
+  uncertainty, capped by `max_uncertainty_boost_arcsec`; candidate alternatives are
+  ranked and ambiguous matches are flagged, not silently forced.
+- Sources below `min_epochs` are retained in `association.below_min_epoch_source_ids`
+  so they can still be retrieved, but they are not plotted as light curves.
+
+Response (abridged; values are illustrative):
+
+```json
+{
+  "success": true,
+  "target": { "ra": 156.09328159, "dec": -41.64466331 },
+  "query": {
+    "radius_deg": 0.05,
+    "cutout_size_deg": 0.1,
+    "collection": "spherex_qr3",
+    "bands": ["SPHEREx-D3"]
+  },
+  "epochs_considered": 2,
+  "epochs_processed": 2,
+  "products_processed": 2,
+  "sources": [
+    {
+      "source_id": "0123456789abcdef0123456789abcdef",
+      "reference_ra_deg": 156.0932,
+      "reference_dec_deg": -41.6446,
+      "epoch_count": 2,
+      "bands": ["SPHEREx-D3"],
+      "position_scatter_arcsec": 0.08,
+      "series": [
+        {
+          "band": "SPHEREx-D3",
+          "expected_epochs": 2,
+          "non_detections": 0,
+          "points": [
+            {
+              "time_utc": "2026-05-17T06:32:37.132800+00:00",
+              "flux_jy": 1.37e-6,
+              "flux_jy_error": 4.2e-8,
+              "unit": "Jy",
+              "band": "SPHEREx-D3",
+              "observation_id": "<observation_id>",
+              "detection_id": "det-...",
+              "snr": 32.6,
+              "quality": "PASS",
+              "flags": []
+            }
+          ],
+          "metrics": {
+            "status": "computed",
+            "unit": "Jy",
+            "n_points": 2,
+            "mean_flux_jy": 1.38e-6,
+            "median_flux_jy": 1.38e-6,
+            "weighted_mean_flux_jy": 1.38e-6,
+            "fractional_variability": 0.03,
+            "chi2": 1.8,
+            "dof": 1,
+            "reduced_chi2": 1.8,
+            "temporal_baseline_days": 33.8,
+            "flags": []
+          }
+        }
+      ],
+      "flags": []
+    }
+  ],
+  "failures": [],
+  "association": {
+    "method": "angular_nearest_neighbour",
+    "version": "phase3-angular-association-v1",
+    "match_radius_arcsec": 6.0,
+    "input_epochs": 2,
+    "input_detections": 2,
+    "source_count": 1,
+    "multi_epoch_sources": 1,
+    "below_min_epoch_sources": 0,
+    "below_min_epoch_source_ids": [],
+    "sources_truncated": false,
+    "ambiguous_matches": 0,
+    "duplicates_dropped": 0,
+    "missing_position_dropped": 0,
+    "excluded": []
+  },
+  "warnings": [],
+  "provenance": {
+    "association": "phase3-angular-association-v1",
+    "variability": "phase3-variability-metrics-v1"
+  }
+}
+```
+
+Scientific boundaries:
+
+- `source_id` is an **internal association id**, not an official SPHEREx or external
+  catalogue identity.
+- Non-detections are counted in `non_detections`; they are never converted to zero
+  flux or fabricated upper limits.
+- Variability metrics (`fractional_variability`, `chi2`, `dof`, `reduced_chi2`,
+  `chi2_pvalue`, robust range, baseline, gaps) are **evidence**, not a classification.
+  A high metric does not by itself make a transient or variable.
+- `metrics.status` is `computed`, `insufficient_data` or `undefined_uncertainties`.
+  When `F_var` is undefined, it is `null`, not negative or forced to a real score.
+- Per-epoch failures are returned in `failures`; they are not silently dropped.
+  An empty `sources` list with `no_multi_epoch_sources` is a valid "nothing found"
+  result, not an error.
+
+### 4.14 `GET /sources/{source_id}`
+
+Returns one source persisted by a completed target light-curve/variability request.
+
+```bash
+curl -s http://localhost:8000/api/v1/sources/0123456789abcdef0123456789abcdef
+```
+
+```json
+{
+  "success": true,
+  "source": {
+    "source_id": "0123456789abcdef0123456789abcdef",
+    "reference_ra_deg": 156.0932,
+    "reference_dec_deg": -41.6446,
+    "detection_count": 2,
+    "epoch_count": 2,
+    "bands": ["SPHEREx-D3"],
+    "detections": [],
+    "position_scatter_arcsec": 0.08,
+    "ambiguity_count": 0,
+    "flags": [],
+    "association_method": "angular_nearest_neighbour",
+    "association_version": "phase3-angular-association-v1"
+  },
+  "target": { "ra": 156.09328159, "dec": -41.64466331 },
+  "query": {
+    "radius_deg": 0.05,
+    "cutout_size_deg": 0.1,
+    "collection": "spherex_qr3",
+    "bands": ["SPHEREx-D3"],
+    "start_date": null,
+    "end_date": null
+  },
+  "provenance": {
+    "created_at": "2026-11-15T00:00:00+00:00",
+    "software": {},
+    "association": "phase3-angular-association-v1",
+    "variability": "phase3-variability-metrics-v1"
+  }
+}
+```
+
+- `source_id` is exactly 32 lowercase hex characters, derived deterministically from
+  the association key. It is internal, not a catalogue identity.
+- Unknown or malformed ids return `404 SOURCE_NOT_FOUND` before any filesystem access.
+- Persisted records survive cache expiry and process restarts. Sources below
+  `min_epochs` are still returned here for review.
+- Each matched detection includes ranked `candidates[]` (with `selected`),
+  `separation_arcsec`, `position_sigma_arcsec` and
+  `effective_match_radius_arcsec` for audit.
+
+### 4.15 `GET /sources/{source_id}/lightcurve`
+
+Returns the persisted `SourceLightCurve` object for one source (per-band `series[]`,
+points, non-detections and metrics). A below-minimum source returns `series: []` with
+`below_min_epochs`/`no_light_curve` flags; flux and upper limits are never invented.
+
+### 4.16 `POST /targets/variability` and `GET /sources/{source_id}/variability`
+
+`POST /targets/variability` accepts the same body as `/targets/lightcurve` and returns
+per-source `band_metrics[]` without repeating point arrays. It still runs the same
+bounded discovery/detection/photometry/association pipeline and returns the same
+`failures[]`, `association` summary and provenance.
+
+`GET /sources/{source_id}/variability` returns the equivalent object for one persisted
+source. Use the compact variability response for review tables and fetch the light
+curve separately for plotting. Metrics remain evidence, not classification.
+
+---
+
+### 4.17 `POST /spectra/extract`
+
+Extracts one spectrum from the SPHEREx DR1 All-Sky Cube at either a persisted
+Phase 3 `source_id` or explicit `ra`/`dec`. The two forms are mutually exclusive.
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/spectra/extract \
+  -H 'Content-Type: application/json' \
+  -d '{"ra":156.09328159,"dec":-41.64466331,"config":{"spatial_method":"bilinear"}}'
+```
+
+The cube is a static survey mosaic (not an epoch-resolved observation). The first
+request downloads the 320,909,760-byte tile and can take several minutes; later
+requests use the hash-addressed FITS cache. Flux is calibrated **surface brightness**
+in `MJy/sr`, not integrated source flux. The cube has no `VARIANCE` extension, so every
+`uncertainty_mjy_sr` is `null` and `quality.uncertainty_status` is `NOT_VERIFIED`.
+Blank channels (for the validated tile: indices 50 and 51) and invalid-flag channels
+keep `flux_mjy_sr: null` with `quality: "FAIL"` and an explicit `flags_applied` reason.
+
+Key response fields: `spectrum_id` (32 lowercase hex), `source_id`, `product_id`,
+`channel_count`, `valid_channel_count`, `blank_channels`, `channels[]` (wavelength,
+flux, NHITS, FLAGS, quality), `quality`, `limitations`, and `provenance` (archive URL,
+FITS SHA-256, HEALPix `npix`/`order`, config and software versions).
+
+### 4.18 `GET /spectra/{spectrum_id}`
+
+Returns the persisted spectrum and provenance. Unknown or malformed ids return
+`404 SPECTRUM_NOT_FOUND`; unreadable stored JSON returns `500 SPECTRUM_STORAGE_ERROR`.
+
+```bash
+curl -s http://localhost:8000/api/v1/spectra/<spectrum_id>
+```
+
+### 4.19 `GET /sources/{source_id}/spectra`
+
+Lists lightweight spectrum summaries associated with a persisted Phase 3 source.
+Channel arrays are intentionally omitted from this listing; fetch `GET /spectra/{id}`
+for the full spectrum. An unknown source returns `404 SOURCE_NOT_FOUND`.
+
+### 4.20 `POST /spectra/compare`
+
+Compares two stored spectra by pairing valid channels on central wavelength, not by
+array position. `config.min_overlap_channels` (default 5) and
+`config.wavelength_tolerance_um` (default `1e-4`) control the match. The response
+reports `comparison_basis` (`same_spectrum`, `same_product_static_mosaic` or
+`different_products_static_mosaic`), `grid_compatible`, per-channel difference/ratio,
+quality and warnings.
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/spectra/compare \
+  -H 'Content-Type: application/json' \
+  -d '{"spectrum_id_a":"<id-A>","spectrum_id_b":"<id-B>"}'
+```
+
+A cube spectrum has no epoch and no variance. A comparison of different products is a
+comparison of static mosaics at different samples, not evidence of temporal spectral
+variability. No uncertainty, significance or ratio error is fabricated; the result is
+therefore `WARNING` when enough channels overlap and `FAIL` when they do not.
+
+### 4.21 Gaia DR3 catalog endpoints (Phase 5)
+
+Synchronous ESA Gaia Archive TAP queries against `gaiadr3.gaia_source` (verified live;
+details in `docs/GAIA_INTEGRATION.md`). Missing catalog measurements are `null`, never
+`0`. `source_id` is a string. Positions are ICRS at the Gaia reference epoch **J2016.0**.
+
+**`GET /catalogs/gaia/search`** — cone search.
+
+| Query param | Range | Default |
+|---|---|---|
+| `ra` | [0, 360) | required |
+| `dec` | [−90, 90] | required |
+| `radius_arcsec` | (0, 60] | 10 |
+| `magnitude_limit` | [−10, 30] | none |
+| `limit` | [1, 1000] | 1000 |
+
+```json
+{
+  "success": true,
+  "catalog": "Gaia DR3",
+  "query": {"ra": 156.09328159, "dec": -41.64466331, "radius_arcsec": 10.0,
+            "magnitude_limit": null, "limit": 5, "total_found": 1, "truncated": false},
+  "sources": [{
+    "source_id": "5416565780217346432",
+    "coordinates": {"ra": 156.09786, "dec": -41.64594, "reference_epoch": 2016.0,
+                    "ra_error_mas": 0.065, "dec_error_mas": 0.08},
+    "astrometry": {"parallax_mas": 0.362, "pmra_mas_yr": -8.867, "pmdec_mas_yr": 5.384,
+                   "ruwe": 1.039, "ruwe_note": "Renormalised unit weight error; …"},
+    "photometry": {"g": 17.94, "bp": 18.41, "rp": 17.32},
+    "provenance": {"catalog": "Gaia DR3", "retrieved_at": "2026-11-15T00:00:00+00:00",
+                   "query_reference": "…",
+                   "tap_endpoint": "https://gea.esac.esa.int/tap-server/tap/sync"}
+  }],
+  "separations_arcsec": [13.148498]
+}
+```
+
+Empty results are success (`total_found: 0`).
+
+**`POST /catalogs/gaia/crossmatch`** — match external coordinates against Gaia DR3.
+
+```json
+{
+  "coordinates": [{"external_id": "target-001", "ra": 180.123, "dec": 45.678, "epoch": 2020.5}],
+  "config": {"radius_arcsec": 3.0, "propagate_proper_motion": true}
+}
+```
+
+Statuses are `MATCHED` / `AMBIGUOUS` / `UNMATCHED`; a match is never forced and
+`best` is `null` for ambiguous results. Optional proper-motion propagation uses
+Astropy space motion from J2016.0 to the target epoch and reports
+`epoch.propagated`, the propagated coordinates, and a `limitation` string when
+propagation was skipped (missing PM, no epoch, …). Separations are great-circle
+arcseconds. **A coordinate match is not a confirmed physical association**, and a
+missing Gaia counterpart never invalidates a SPHEREx detection (Gaia is optical).
+
+**`GET /catalogs/gaia/{source_id}`** — one record by exact identifier;
+malformed ids → 400 `INVALID_GAIA_SOURCE_ID`, unknown ids → 404
+`GAIA_SOURCE_NOT_FOUND`.
+
+**`GET /sources/{source_id}/catalogs`** — Gaia DR3 association for one persisted
+Phase 3 source (see `docs/GAIA_INTEGRATION.md` §Source association). Unknown or
+malformed internal source ids → `404 SOURCE_NOT_FOUND`; Phase 3 ids are 32-hex
+internal identifiers and are never confused with Gaia's numeric `source_id`.
+
 ---
 
 ## 5. Error codes
@@ -957,25 +1533,47 @@ curl -s http://localhost:8000/api/v1/images/comparisons/<comparison_id>
 | 404 | `OBSERVATION_NOT_FOUND` | unknown observation id |
 | 404 | `COMPARISON_NOT_FOUND` | unknown or malformed comparison id |
 | 404 | `FILE_NOT_FOUND` | file not generated by this app |
+| 404 | `SOURCE_NOT_FOUND` | unknown internal source id |
+| 404 | `SPECTRAL_PRODUCT_NOT_FOUND` | no DR1 cube covers the requested position |
+| 404 | `SPECTRUM_NOT_FOUND` | unknown or malformed spectrum id |
 | 422 | `INVALID_REQUEST` | request schema validation failed |
+| 422 | `SPECTRAL_PRODUCT_UNSUPPORTED` | product is not a supported cube / extraction format |
+| 422 | `SPECTRAL_TARGET_OUTSIDE_PRODUCT` | target lies outside the cube tile WCS |
+| 422 | `SPECTRAL_EXTRACTION_FAILED` | cube sampling or channel extraction failed |
 | 422 | `IMAGE_PROCESSING_LIMIT` | image pair exceeds `MAX_COMPARISON_PIXELS` |
 | 422 | `REPROJECTION_FAILED` | WCS transform or interpolation failed |
 | 422 | `MISSING_ACCESS_URL` | SIA row has no FITS product |
 | 422 | `UNTRUSTED_ACCESS_URL` | URL not HTTPS or not on IRSA host |
 | 422 | `UNSUPPORTED_PRODUCT` | non-FITS `access_format` |
 | 422 | `MISSING_IMAGE_EXTENSION` | no 2D science image in the product |
+| 422 | `IMAGE_PREPARATION_FAILED` | image has no usable science pixels / invalid data |
+| 422 | `SOURCE_DETECTION_FAILED` | detection input or algorithm failed |
+| 422 | `PHOTOMETRY_FAILED` | aperture photometry input or algorithm failed |
+| 422 | `INSUFFICIENT_DATA` | no data sufficient for the requested analysis |
 | 502 | `IRSA_HTTP_ERROR` | IRSA returned an HTTP error |
 | 502 | `IRSA_INVALID_RESPONSE` | IRSA returned non-VOTable / unparseable data |
 | 502 | `IRSA_QUERY_ERROR` | IRSA rejected the SIA query |
+| 400 | `INVALID_GAIA_SOURCE_ID` | malformed Gaia `source_id` |
+| 404 | `GAIA_SOURCE_NOT_FOUND` | no Gaia DR3 record for a well-formed id |
+| 502 | `GAIA_HTTP_ERROR` | Gaia Archive returned an HTTP error |
+| 502 | `GAIA_QUERY_ERROR` | Gaia Archive rejected the ADQL query |
+| 502 | `GAIA_INVALID_RESPONSE` | Gaia response unparseable |
+| 503 | `GAIA_UNAVAILABLE` | Gaia Archive unreachable |
+| 503 | `GAIA_RATE_LIMITED` | Gaia Archive asked for back-off (HTTP 429) |
+| 504 | `GAIA_TIMEOUT` | Gaia Archive request timed out |
 | 502 | `INVALID_FITS_FILE` | HTML/XML body, corrupt or incomplete FITS |
 | 503 | `IRSA_UNAVAILABLE` | connection failure |
 | 503 | `IRSA_CUTOUT_UNAVAILABLE` | cutout service busy/error after retries |
-| 503 | `PROCESSING_BUSY` | too many comparisons in flight; retry shortly |
+| 503 | `SPECTRAL_PRODUCT_UNAVAILABLE` | cube archive temporarily unavailable |
+| 503 | `PROCESSING_BUSY` | too many detection/comparison/spectral jobs in flight; retry shortly |
 | 504 | `IRSA_TIMEOUT` | IRSA request timed out |
+| 500 | `SOURCE_STORAGE_ERROR` | stored source record is corrupt/unreadable |
+| 500 | `SPECTRUM_STORAGE_ERROR` | stored spectrum record is corrupt/unreadable |
 | 500 | `PREVIEW_GENERATION_FAILED` | preview rendering failed (e.g. all pixels invalid) |
 | 500 | `INTERNAL_ERROR` | unexpected server error |
 
-Successful HTTP 200 with empty results only ever means "no matching observations".
+HTTP 200 with empty results means "nothing matched": no archive rows, no detections, or
+no multi-epoch sources. It is not a failure and must not be rendered as a fake detection.
 
 ---
 
@@ -1023,6 +1621,47 @@ curl -s -X POST http://localhost:8000/api/v1/images/compare \
 
 # Phase 2: retrieve a stored comparison
 curl -s http://localhost:8000/api/v1/images/comparisons/<comparison_id>
+
+# Phase 3: detect sources in one epoch
+curl -s -X POST http://localhost:8000/api/v1/sources/detect \
+  -H 'Content-Type: application/json' \
+  -d '{"observation_id":"<id>","ra":156.09328159,"dec":-41.64466331,"size":0.05}'
+
+# Phase 3: aperture photometry for the same epoch
+curl -s -X POST http://localhost:8000/api/v1/sources/photometry \
+  -H 'Content-Type: application/json' \
+  -d '{"observation_id":"<id>","ra":156.09328159,"dec":-41.64466331,"size":0.05}'
+
+# Phase 3: target light curve across epochs (small bound for a first call)
+curl -s -X POST http://localhost:8000/api/v1/targets/lightcurve \
+  -H 'Content-Type: application/json' \
+  -d '{"ra":156.09328159,"dec":-41.64466331,"radius_deg":0.05,
+       "cutout_size_deg":0.05,"bands":["SPHEREx-D3"],"max_observations":5}'
+
+# Phase 3: target variability metrics only
+curl -s -X POST http://localhost:8000/api/v1/targets/variability \
+  -H 'Content-Type: application/json' \
+  -d '{"ra":156.09328159,"dec":-41.64466331,"radius_deg":0.05,
+       "cutout_size_deg":0.05,"bands":["SPHEREx-D3"],"max_observations":5}'
+
+# Phase 3: persisted source detail, light curve and variability
+curl -s http://localhost:8000/api/v1/sources/<source_id>
+curl -s http://localhost:8000/api/v1/sources/<source_id>/lightcurve
+curl -s http://localhost:8000/api/v1/sources/<source_id>/variability
+
+# Phase 4: extract a DR1 cube spectrum (first call downloads ~306 MiB)
+curl -s -X POST http://localhost:8000/api/v1/spectra/extract \
+  -H 'Content-Type: application/json' \
+  -d '{"ra":156.09328159,"dec":-41.64466331}'
+
+# Phase 4: stored spectra
+curl -s http://localhost:8000/api/v1/spectra/<spectrum_id>
+curl -s http://localhost:8000/api/v1/sources/<source_id>/spectra
+
+# Phase 4: compare two stored spectra by wavelength
+curl -s -X POST http://localhost:8000/api/v1/spectra/compare \
+  -H 'Content-Type: application/json' \
+  -d '{"spectrum_id_a":"<id-A>","spectrum_id_b":"<id-B>"}'
 ```
 
 ### Python
@@ -1064,6 +1703,55 @@ if comparison["status"] == "completed":
     requests.get(f"http://localhost:8000{comparison['difference']['fits_url']}", timeout=60).content
 else:
     print([c for c in comparison["quality"]["checks"] if c["status"] == "FAIL"])
+
+# Phase 3: detection + photometry for one epoch
+detection = requests.post(
+    f"{BASE}/sources/detect",
+    json={"observation_id": first["observation_id"], "ra": TARGET["ra"], "dec": TARGET["dec"], "size": 0.05},
+    timeout=300,
+).json()
+print(detection["total_detections"], detection["quality"]["overall_status"])
+
+photometry = requests.post(
+    f"{BASE}/sources/photometry",
+    json={"observation_id": first["observation_id"], "ra": TARGET["ra"], "dec": TARGET["dec"], "size": 0.05},
+    timeout=300,
+).json()
+for measurement in photometry["measurements"]:
+    print(measurement["detection_id"], measurement["flux_jy"], measurement["flux_jy_error"], measurement["quality"])
+
+# Phase 4: extract a DR1 cube spectrum
+spectrum = requests.post(
+    f"{BASE}/spectra/extract",
+    json={"ra": TARGET["ra"], "dec": TARGET["dec"]},
+    timeout=900,
+).json()
+print(spectrum["spectrum"]["valid_channel_count"], spectrum["spectrum"]["quality"])
+
+# Phase 4: retrieve and compare stored spectra
+second = requests.post(
+    f"{BASE}/spectra/extract",
+    json={"ra": TARGET["ra"] + 0.001, "dec": TARGET["dec"]},
+    timeout=900,
+).json()
+comparison = requests.post(
+    f"{BASE}/spectra/compare",
+    json={"spectrum_id_a": spectrum["spectrum"]["spectrum_id"],
+          "spectrum_id_b": second["spectrum"]["spectrum_id"]},
+    timeout=60,
+).json()
+print(comparison["comparison"]["comparison_basis"], comparison["comparison"]["quality"])
+
+# Phase 3: target light curve (keep max_observations small for a first run)
+curve = requests.post(
+    f"{BASE}/targets/lightcurve",
+    json={"ra": TARGET["ra"], "dec": TARGET["dec"], "radius_deg": 0.05,
+          "cutout_size_deg": 0.05, "bands": ["SPHEREx-D3"], "max_observations": 5},
+    timeout=900,
+).json()
+for source in curve["sources"]:
+    for series in source["series"]:
+        print(source["source_id"], series["band"], len(series["points"]), series["metrics"]["status"])
 ```
 
 ### Reusable Python functions
@@ -1103,6 +1791,32 @@ service.get_comparison("<comparison_id>")
 Lower-level building blocks are also reusable: `inspect_fits(path, ...)` (inspection),
 `reproject(data, valid, variance, wcs, grid)` and `measure_residual_shift(a, b, mask)`
 (reprojection/alignment), and `estimate_background(data, valid)`.
+
+Phase 3 entry points:
+
+```python
+from app.schemas.lightcurve import TargetLightCurveRequest
+from app.schemas.photometry import PhotometryRequest
+from app.schemas.sources import DetectionRequest
+from app.services.lightcurve_service import TargetLightCurveService
+from app.services.photometry import PhotometryService
+from app.services.source_detection import SourceDetectionService
+
+detection = SourceDetectionService(observations)
+photometry = PhotometryService(observations, detection)
+curves = TargetLightCurveService(observations, detection, photometry)
+
+detection.detect(DetectionRequest(observation_id="<id>", ra=156.09328159, dec=-41.64466331, size=0.05))
+photometry.measure(PhotometryRequest(observation_id="<id>", ra=156.09328159, dec=-41.64466331, size=0.05))
+curves.build(TargetLightCurveRequest(ra=156.09328159, dec=-41.64466331, radius_deg=0.05, cutout_size_deg=0.05))
+curves.catalog.source("<source_id>")
+curves.catalog.lightcurve("<source_id>")
+curves.catalog.variability("<source_id>")
+```
+Reusable scientific primitives: `prepare_image` (masks/background/noise/PSF/solid angle),
+`detect_prepared`, `measure_sources`, `associate_measurements` and
+`variability_metrics`/`build_light_curves`. The algorithms are deterministic and their
+version strings are recorded on every derived response.
 
 ---
 
@@ -1156,7 +1870,7 @@ Deterministic suite (mocked HTTP, synthetic FITS fixtures, fixed seeds):
 uv run pytest -q
 ```
 
-Expected: **223 passed, 6 skipped** (the 6 skips are the opt-in live IRSA tests).
+Expected: **388 passed, 7 skipped** (the 7 skips are the opt-in live IRSA tests; includes the 73 Gaia DR3 tests from Phase 5).
 `compileall` and `pyflakes` are part of the fresh-install check.
 
 Phase 2 review additions:
@@ -1166,6 +1880,19 @@ Phase 2 review additions:
 | `tests/test_variance_propagation.py` | 14 analytic tests: constant/nonuniform variance, integer and fractional sampling, bilinear weights, masked neighbours, NaN and negative variance, boundary clamping, no valid support, science/variance alignment, and an explicit proof that variance is *not* interpolated like a scalar image |
 | `tests/test_scientific_validity.py` | `scientifically_valid` is derived; every critical check must be PASS; missing units/variance/mask/PSF, disabled background correction, relative photometry and unverifiable alignment are `NOT_VERIFIED` and block validity; `NOT_VERIFIED` is never serialized as `PASS` |
 | `tests/test_psf_compatibility.py` | compatible PSF verified but not matched, missing/one-sided EPSF metadata `NOT_VERIFIED`, mismatch `FAIL`, warning band, matching unsupported without metadata, matching performed only on request, provenance |
+
+Phase 3 additions:
+
+| File | What it pins |
+|---|---|
+| `tests/test_image_preparation.py` | validity masking, background/noise, variance handling, pixel solid angle, PSF summary, no zero-filling of invalid pixels |
+| `tests/test_source_detection.py` | matched-filter detection, threshold/min-area behaviour, deblending, edge/blend flags, WCS positions, deterministic ids, empty results and provenance |
+| `tests/test_photometry.py` | fractional apertures, annulus/global background fallback, variance uncertainty, MJy/sr to Jy conversion, unit handling, invalid-pixel coverage and no aperture correction |
+| `tests/test_source_association.py` | great-circle matching, same-epoch duplicates, ambiguity flags, missing positions, position scatter, uncertainty-aware radii, ranked candidates and deterministic source ids |
+| `tests/test_variability.py` | F_var/χ²/dof/p-value, MAD/robust sigma, baseline/gaps, insufficient-data and undefined-uncertainty states |
+| `tests/test_lightcurve_service.py` | timeline to per-band series, non-detection counts, per-epoch failure isolation, product selection, caching and response contract |
+| `tests/test_source_api.py` | `/sources/detect`, `/sources/photometry`, `/targets/lightcurve`, `/targets/variability`, `/sources/{id}/*`, source persistence across cache clear, single-epoch retention, typed 404, error envelope, 422 behaviour and OpenAPI paths |
+| `tests/test_live_phase3.py` | opt-in live two-epoch D3 detection, photometry, association, variability and persisted source round-trip |
 
 ### Fresh-install integration check
 
@@ -1246,10 +1973,29 @@ timeline 126 products → 63 observations → 63 epochs, 33.81-day baseline,
 live service: 2 passed in 93 s | live API workflow: 1 passed in 73 s
 ```
 
-Phase 2 deterministic suite (`uv run pytest -q`): **223 passed, 6 skipped** —
-98 Phase 2 tests for inspection, reprojection, variance propagation, alignment,
-scientific validity, PSF compatibility, comparison and the new API, with the same
-6 opt-in live skips.
+Phase 3/4 + Phase 5 (Gaia) deterministic suite (`uv run pytest -q`): **388 passed, 7 skipped**
+in 34-57 s - the Phase 2 baseline plus 57 Phase 3 tests covering image preparation,
+detection, aperture photometry, uncertainty-aware association, variability, the target
+light-curve service, source persistence and the new API routes. The 7 skips are the
+opt-in live IRSA tests. `pyflakes`, `compileall` and `git diff --check` are clean.
+
+Phase 4 genuine DR1 cube validation on 2026-11-15:
+
+```
+cube tile Npix9621_cube.fits  320,909,760 bytes, 102 x 512 x 512
+target pixel (282.099, 229.071), inside=true, 13.983 arcsec/px
+channels 0.753-4.988 um; 100 valid; blank channels 50, 51 (NHITS=0)
+target channel flags = SOURCE informational; no VARIANCE extension
+flux range ~0.023-1.438 MJy/sr; spectrum status WARNING / NOT_VERIFIED
+```
+
+Phase 3 live validation on 2026-11-15:
+
+```
+detect/photometer 2 D3 epochs at RA 156.09328159, Dec -41.64466331
+association: per-band series + variability metrics; persisted source round-trip
+1 passed in 40.23 s
+```
 
 Phase 2 live validation on 2026-11-14 (after IRSA's proxy recovered):
 
@@ -1315,10 +2061,12 @@ Not implemented (deliberately): Redis, Celery, databases, background workers.
 
 ## 10. Known limitations / future work
 
-1. **Phase 2 scope.** Multi-epoch discovery, FITS inspection and pairwise image
-   comparison are implemented. There is no light-curve, catalogue photometry or spectral
-   endpoint; timeline responses still report `comparability_assessed: false` because the
-   timeline itself does not assess comparability — `/images/compare` does, per pair.
+1. **Phase status.** Multi-epoch discovery, FITS inspection, pairwise comparison,
+   source detection, aperture photometry, per-band light curves and DR1 cube spectral
+   extraction/comparison are implemented. PSF photometry, forced photometry,
+   multi-epoch spectra and candidate classification are not. Timeline responses still
+   report `comparability_assessed: false` because the timeline itself does not assess
+   comparability - `/images/compare` does, per pair.
 2. **Epoch = `obs_id`.** No documented visit/sequence grouping exists in SIA2, so
    consecutive exposures are separate epochs. If a future data release documents
    visits, grouping can be added without changing product-level fields.
@@ -1329,8 +2077,10 @@ Not implemented (deliberately): Redis, Celery, databases, background workers.
 4. **Spatial relevance is footprint-based.** `target_covered` uses `s_region`
    (`POLYGON`/`CIRCLE`); unsupported region encodings return `null` with a warning
    rather than a guessed result.
-5. **No spectral extraction.** `WCS-WAVE` is inspected but not used; the `EPSF` table is
-   used only for its median FWHM. Spectral cubes and band-to-band SED work are Phase 3+.
+5. **Spectra are DR1 cube surface brightness, not source spectra.** The cube is a static
+   mosaic with no `VARIANCE`; extracted flux is `MJy/sr` at a sampled position, not an
+   integrated source flux and not a time series. Spectral images (`WCS-WAVE`) are only
+   inspected. Band-to-band SED modelling and spectral slope fitting are future work.
 6. **Preview is not calibrated.** Percentile + asinh scaling is for display only.
 7. **SIA ID lookup latency.** First detail lookup after cache expiry takes ~20 s.
    Increase TTL or persist the row cache if this matters.
@@ -1373,8 +2123,9 @@ Phase 2 scientific limitations (explicit, not hidden):
     annotations, not defects, and are not masked — masking `SOURCE` would delete every
     real source; verified live: valid fraction 0.15 → 0.96). Unflagged transient
     artefacts remain.
-19. **Difference products are measurements, not detections.** No source extraction,
-    significance map, thresholding or light curve is produced. `robust_sigma` is a MAD
+19. **Difference products are measurements, not detections.** The Phase 2 comparison
+    endpoint does not extract sources, threshold a significance map or build light
+    curves; those steps live in the separate Phase 3 endpoints. `robust_sigma` is a MAD
     estimate over the difference pixels.
 20. **Only same-band pairs are scientifically meaningful.** The API does not enforce band
     equality (the caller decides), but cross-band subtraction is not valid with this
@@ -1393,3 +2144,62 @@ Phase 2 scientific limitations (explicit, not hidden):
     `scientifically_valid`, so products missing `BUNIT`, `FLAGS`, `VARIANCE` or `EPSF`
     will report `false` even when the difference image itself looks reasonable. This is
     intentional: the API never upgrades missing evidence to a pass.
+
+Phase 3 scientific limitations (explicit, not hidden):
+
+24. **Detection is a fixed matched-filter baseline.** A single global noise estimate and
+    a Gaussian filter (default FWHM 1.5 px) are used for the whole image. Crowded fields,
+    extended sources, structured backgrounds and source confusion need different
+    settings; the response records the config but does not auto-tune it.
+25. **Deblending is simple.** A connected component is split at local maxima above 25%
+    of its brightest peak, with nearest-peak pixel assignment. Close or heavily blended
+    sources can remain merged or be split incorrectly; `blended` is a flag, not a
+    validated deblend.
+26. **Photometry is circular-aperture only.** No PSF fitting, no aperture correction and
+    no forced photometry. `aperture_correction_applied` is always `false`, so the flux
+    misses wings outside the aperture and can be biased in crowded fields. The uncertainty
+    model does not include calibration/systematic errors.
+27. **Flux conversion assumes a constant pixel solid angle.** `solid_angle_sr` is derived
+    from the projection-plane WCS model. This is appropriate for the small SPHEREx
+    cutouts used here but is not a full spherical-area integration for large or strongly
+    distorted fields.
+28. **Association is angular nearest-neighbour.** The base radius is expanded by a
+    bounded centroid-uncertainty term, and candidate alternatives are ranked. Proper
+    motion, extended-source morphology and chance coincidences are not modelled, and
+    the centroid uncertainty excludes WCS/astrometric calibration error. An internal
+    `source_id` is not a catalogue identity.
+29. **Light curves are not forced-photometry products.** A point exists only when the
+    source is detected in that epoch and band. `non_detections` counts missing epochs;
+    it is not an upper limit. There is no image-level combination across bands.
+30. **Variability metrics are descriptive.** `fractional_variability`, `chi2`, reduced
+    `chi2`, `chi2_pvalue`, MAD/robust sigma and ranges assume independent Gaussian
+    measurement errors. Correlated noise, crowding and calibration drift are not
+    included. No candidate classification or significance claim is made.
+31. **The light-curve and variability endpoints are synchronous.** They process at most
+    `max_observations` epochs per request (default 20, maximum 200) and have no job
+    queue, cancellation or progress stream. Large requests can exceed normal HTTP
+    timeouts.
+32. **One product per epoch.** If several products share an epoch/band, the service
+    chooses one deterministically; duplicate products are not averaged. All requested
+    bands for a selected epoch are retained.
+
+Phase 4 scientific limitations (explicit, not hidden):
+
+33. **The cube has no epoch dimension.** DR1 is a survey mosaic; two spectra are not two
+    observations of one source. `comparison_basis` says whether products are the same or
+    different, and the response warns that no temporal variability is established.
+34. **No cube variance or uncertainty.** `uncertainty_mjy_sr` is always `null` and
+    `uncertainty_status` is `NOT_VERIFIED`. Local spatial scatter is crowding-dominated
+    and is not substituted for a flux uncertainty. No significance or ratio error is
+    computed.
+35. **Flux is surface brightness.** The extraction is a point sample in `MJy/sr` with no
+    aperture integration, PSF correction or total-source flux conversion.
+36. **Comparison is wavelength matching, not resampling.** Channels match within
+    `wavelength_tolerance_um`; unmatched valid channels are excluded and reported. No
+    interpolation, common-grid resampling or uncertainty propagation is performed.
+37. **Only the DR1 cube supports extraction.** Spectral-image products are inspected for
+    one channel but are not treated as spectra; other archives/products fail explicitly.
+33. **Persisted source records are best-effort and bounded.** Source/light-curve JSON is
+    written under `storage/`; a write failure is logged but does not fail the target
+    response, so a subsequent `GET /sources/{id}` can return 404 until a retry succeeds.
+    Stored records are never used to fabricate new measurements.
